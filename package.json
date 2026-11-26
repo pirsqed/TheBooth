@@ -1,0 +1,32 @@
+{
+  "name": "the-booth",
+  "version": "0.1.0",
+  "description": "Headless AI Audio Drama & Spoken-Word Studio",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "mcp": "tsx src/mcp/index.ts",
+    "mcp:start": "node dist/mcp/index.js",
+    "build": "tsc -p tsconfig.build.json --noEmitOnError",
+    "postbuild": "node scripts/mark-build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@google/genai": "^3.6.1",
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "@resvg/resvg-js": "^2.6.2",
+    "dotenv": "^18.0.10",
+    "fastify": "^5.12.8",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.0",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2",
+    "vitest": "^3.0.7"
+  }
+}
