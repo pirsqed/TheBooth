@@ -15,6 +15,12 @@ Most TTS scripts stitch raw API clips straight to digital silence—resulting in
 - **Late-Night, Sleep, Meditation & PMR Authors:** Built with headphone comfort as a first-class rule—continuous warm room tone so long pauses never drop into digital vacuum, gentle leveling that protects whispers, and optional master normalization off by default so quiet fade-outs stay quiet.
 - **Developers & Voice-App Builders:** Integrate a clean, filesystem-backed REST API (`project.json` + immutable WAV takes) with a provider-agnostic `TtsProvider` interface, reference **Gemini 3.8 Flash TTS** adapter, and an offline `MockTtsProvider` for deterministic zero-cost testing.
 
+> ### Model & MCP Host Compatibility (Please Read)
+>
+> - **Tested on Gemini 4 only:** The full multimodal agent workflow—listening directly to inline MCP `audio` blocks and inspecting `booth_inspect_visual` waveform/RMS/spectrogram charts—has **only been tested and empirically calibrated on Gemini 4** so far.
+> - **Claude, ChatGPT & other models:** We cannot yet vouch for how well Claude, ChatGPT, or other models' native audio-listening or visual-audio spectrogram inspection chops hold up on this workflow.
+> - **MCP host audio support varies:** Some MCP clients do not yet forward inline `audio` content blocks to the model. Even on text-only or vision-only hosts, you still get the full REST/MCP production engine, numeric loudness & L/R stereo telemetry, `booth_inspect_visual` PNG charts, and the built-in multimodal Director loop (`gemini-3.5-flash`).
+
 ---
 
 ## Why The Booth? (Two-Stage DAW Architecture)
@@ -111,7 +117,16 @@ Build once (`npm run build`), then register The Booth in your MCP client config 
 
 Once connected, your agent gets **34 MCP tools** covering the full production pipeline—projects, script import, voice catalog/design/auditioning, Stage-1 synthesis, inline audio listening (`audio/wav` / `audio/ogg`), beds & SFX, Stage-2 mixdown, automated Director review, and visual-audio inspection (`image/png`).
 
-> **Want a fierce creative partner in the booth?** Drop [`directors/margaux_auteur.md`](./directors/margaux_auteur.md) into your agent's system prompt for **Margaux Laurent**—a grizzled radio-drama auteur who fights for breath, overlaps, and honest takes instead of rubber-stamping flat first drafts.
+#### Companion Agent Skill & Director Persona
+
+- **Recommended — Agent Skill ([`skills/the-booth/SKILL.md`](./skills/the-booth/SKILL.md)):** Drop-in, persona-neutral **"soft director"** skill for MCP-connected agents. Copy or symlink `skills/the-booth/` into your agent's skills directory (e.g., `~/.gemini/config/skills/`, `~/.agents/skills/`, or `~/.claude/skills/`). It teaches your agent to cast and block scenes before spending synthesis tokens, keep Stage-1 acting separate from free Stage-2 mix edits, cap retakes at 2–3, and run calibrated **Eyes + Ears** final QC—without overriding the agent's own voice.
+- **Optional — Full Auteur Mode ([`directors/margaux_auteur.md`](./directors/margaux_auteur.md)):** Want a fierce creative partner who pushes back on flat first drafts? Load **Margaux Laurent** into your agent's system prompt for a grizzled radio-drama auteur who fights for breath, overlaps, and honest takes.
+
+#### Try This as Your First Prompt
+
+Once the MCP server (and optional skill) is connected, try prompting your agent with:
+
+> *"Create a Booth project called `midnight_train`, audition two contrasting voices for Mara and Julian, block a short 2-speaker noir exchange with stereo panning and a natural interruption overlap, mix it to OGG, and verify the final mix with both ears and `booth_inspect_visual`."*
 
 See the full setup & tool catalog in **[docs/mcp.md](./docs/mcp.md)**.
 
@@ -166,7 +181,7 @@ Read the complete authoring guide (including EQ/pan tables and full genre exampl
 
 ### 3. Drive the Local REST API
 
-Start the server (`npm run dev`), then create a project, cast a voice, import a script, render takes, and run a zero-cost stereo mixdown:
+Start the server (`npm run dev`), then create a project, cast a voice, import a script, render takes, and run a zero-cost stereo mixdown. *(No `GEMINI_API_KEY` yet? Swap `"provider": "mock"` and `"providerVoiceId": "mock_mara"` in step 2 to run the full loop—including OGG export and `/visual` PNG charts—completely offline.)*
 
 ```bash
 # 1. Create a project (initializes default warm_dark room tone)
@@ -216,7 +231,11 @@ Beyond basic synthesis and mixing, The Booth includes three studio-grade product
 
 1. **Voice Discovery, Design & Auditions:** Filter prebuilt and Extended Voice Library voices (`booth_list_provider_voices`), generate persistent custom or remixed voices via Gemini's `v1beta` Voices API (`booth_design_voice`), and run side-by-side auditions (`booth_audition_voice` → `booth_select_audition`).
 2. **Multimodal Director's Chair:** Run an automated ear-review loop on a single cue (`booth_direct_cue`) or an entire project (`booth_direct_project`) with strict retake budgets (`maxRetakes`, `maxTotalRetakes`). Choose from four built-in personas (`default`, `intimate_sleep`, `audio_drama`, `audiobook`) or supply your own persona instructions.
-3. **Visual-Audio Inspection ("Eyes + Ears"):** Render `1600×900` PNG charts (`booth_inspect_visual` / `GET .../visual`) in `master` mode (4-panel DAW Cue Overlay + Split L/R Waveforms + Split L/R & Combined 300 ms RMS on a 3 dB grid + Log-Mel Spectrogram) or zero-JS `fast` mode (pure FFmpeg). Designed from blind psychophysics testing ([study spec](./docs/visual-audio-psychophysics-study.md)) to catch stereo pan errors, room-tone dropouts, clicks, and loudness jumps.
+3. **Visual-Audio Inspection ("Eyes + Ears"):** Render `1600×900` PNG charts (`booth_inspect_visual` / `GET .../visual`) in `master` mode (4-panel DAW Cue Overlay + Split L/R Waveforms + Split L/R & Combined 300 ms RMS on a 3 dB grid + Log-Mel Spectrogram) or zero-JS `fast` mode (pure FFmpeg). Designed from a 3-phase blinded psychophysics study on Gemini 4 ([study spec & results](./docs/visual-audio-psychophysics-study.md)): on matched studio mixes, ears-only caught `0/2` technical defects (mono downmix + smoothed dropout) and eyes-only caught `2/3` (`0.00s` timing error), while **Eyes + Ears together hit `4/4` (100%)**—ears catching delivery mismatches while eyes caught wrong pan, `-4 dB` dips, and micro-clicks.
+
+![The Booth 4-panel visual-audio QC chart showing DAW cues, split L/R waveforms, L/R + combined RMS, and Log-Mel spectrogram](./docs/assets/visual-qc-example.png)
+
+*Real `booth_inspect_visual` (`preset: "master"`) render of a 3-cue stereo exchange (`mara` left `-0.55`, `julian` right `+0.50`): note the `280 ms` overlap at `2.93s` with smooth L/R RMS crossover and subtle headphone crossfeed, continuous `warm_dark` room tone across the `7.0–9.2s` pause (no dead-air dropout), an audible `<sigh>` breath column at `9.5s`, and the `-4 dB` whisper taper on `cue_003`.*
 
 Read the full walkthrough in **[docs/directing-and-qc.md](./docs/directing-and-qc.md)**.
 
@@ -258,9 +277,11 @@ data/
       exports/
         <exportId>.ogg           # Mastered stereo exports (.ogg / .wav / .mp3)
         <exportId>.json          # Export telemetry (LUFS, true peak, L/R RMS, warnings)
+      visuals/
+        <id>_<preset>_<hash>.png # Cached 1600x900 visual-audio QC charts
 ```
 
-Core source modules live under `src/`:
+Core modules and agent assets live under:
 
 - `src/studio/` — Core `StudioService`, atomic `ProjectStore` (per-project mutex), async `JobTracker`
 - `src/audio/` — FFmpeg runner, `autoLevel`, `roomtone`, `eq`, constant-power `pan` + crossfeed, `timeline` resolver, `mixdown` filtergraph compiler, `visualize` PNG engine
@@ -269,6 +290,8 @@ Core source modules live under `src/`:
 - `src/director/` — `DirectorReviewer` contract, `GeminiDirectorReviewer`, `MockDirectorReviewer`, built-in `personas`
 - `src/api/` — Thin Fastify REST server & routes
 - `src/mcp/` — Thin `@modelcontextprotocol/sdk` stdio server (`34` tools + `booth://runtime/idle`)
+- `skills/the-booth/SKILL.md` — Companion persona-neutral Agent Skill ("soft director" + Eyes + Ears QC protocol)
+- `directors/margaux_auteur.md` — Optional drop-in high-friction radio-drama Director persona
 
 ---
 
@@ -292,6 +315,7 @@ Core source modules live under `src/`:
 - **[Script Markup & Authoring Guide](./docs/script-markup.md)** — Complete syntax for `[[...]]` directives, EQ/pan presets, beds, SFX anchoring, and worked examples
 - **[REST API Reference](./docs/rest-api.md)** — All HTTP endpoints, payloads, streaming audio routes, and visual QC parameters
 - **[MCP Server & Tool Reference](./docs/mcp.md)** — Stdio setup, client snippet, inline audio limits, and all 34 MCP tools
+- **[The Booth Agent Skill](./skills/the-booth/SKILL.md)** — Drop-in persona-neutral "soft director" skill & calibrated Eyes + Ears QC protocol
 - **[Casting, Director's Chair & Visual QC Guide](./docs/directing-and-qc.md)** — Voice design, auditions, automated Director personas, and Eyes + Ears inspection
 - **[Margaux Laurent Director Persona](./directors/margaux_auteur.md)** — Drop-in system prompt for a fierce, taste-driven radio-drama director
 - **[Technical Specification](./SPEC.md)** — Original v0.1 architectural design & acoustic rules
