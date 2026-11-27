@@ -1,4 +1,4 @@
-import { Cue, Project, SfxEvent, Take } from '../types/project.js';
+import { BedTrack, Cue, Project, SfxEvent, Take } from '../types/project.js';
 
 export class TimelineError extends Error {
   constructor(
@@ -30,9 +30,19 @@ export interface ResolvedSfxTiming {
   durationMs: number;
 }
 
+export interface ResolvedBedTiming {
+  bedId: string;
+  label: string;
+  startMs: number;
+  endMs: number;
+  durationMs: number;
+}
+
 export interface ResolvedTimeline {
   cues: ResolvedCueTiming[];
   sfx: ResolvedSfxTiming[];
+  beds: ResolvedBedTiming[];
+  leadInMs: number;
   contentEndMs: number;
   tailMs: number;
   totalDurationMs: number;
@@ -44,15 +54,42 @@ export function getActiveTake(cue: Cue): Take | null {
   return cue.takes.find((t) => t.id === cue.activeTakeId) ?? null;
 }
 
+export interface EffectiveTakeSpan {
+  rawDurationMs: number;
+  trimStartMs: number;
+  trimEndMs: number;
+  durationMs: number;
+  isTrimmed: boolean;
+}
+
+/**
+ * Computes the effective playable span of a cue's take after non-destructive `cue.mix.trim`.
+ */
+export function computeEffectiveTakeSpan(cue: Cue, take: Take): EffectiveTakeSpan {
+  const rawDurationMs = Math.max(0, Math.round(take.durationMs));
+  const trimStartMs = Math.min(
+    rawDurationMs,
+    Math.max(0, Math.round(cue.mix.trim?.startMs ?? 0)),
+  );
+  const trimEndMs =
+    cue.mix.trim?.endMs != null
+      ? Math.min(rawDurationMs, Math.max(trimStartMs, Math.round(cue.mix.trim.endMs)))
+      : rawDurationMs;
+  const durationMs = Math.max(0, trimEndMs - trimStartMs);
+  const isTrimmed = trimStartMs > 0 || trimEndMs < rawDurationMs;
+  return { rawDurationMs, trimStartMs, trimEndMs, durationMs, isTrimmed };
+}
+
 /**
  * Resolves every cue and SFX event to concrete (startMs, endMs) timestamps
  * via topological dependency resolution, rejecting cycles and missing anchors.
  */
 export function resolveTimeline(
-  project: Pick<Project, 'cues' | 'sfx' | 'audio'>,
+  project: Pick<Project, 'cues' | 'sfx' | 'audio'> & { beds?: BedTrack[] },
   sfxDurationsMs: Record<string, number> = {},
 ): ResolvedTimeline {
   const warnings: string[] = [];
+  const leadInMs = Math.max(0, Math.round(project.audio.leadInMs ?? 0));
   const cueMap = new Map<string, Cue>();
   const cueIndexMap = new Map<string, number>();
 
@@ -102,14 +139,16 @@ export function resolveTimeline(
     const cue = cueMap.get(cueId)!;
     const anchorCueId = anchorOf.get(cueId) ?? null;
 
-    let anchorEndMs = 0;
+    let anchorEndMs = leadInMs;
     if (anchorCueId !== null) {
       const anchorResolved = visit(anchorCueId, [...stack, cueId]);
       anchorEndMs = anchorResolved.endMs;
     }
 
     const activeTake = getActiveTake(cue);
-    const durationMs = activeTake ? Math.max(0, Math.round(activeTake.durationMs)) : 0;
+    const durationMs = activeTake
+      ? computeEffectiveTakeSpan(cue, activeTake).durationMs
+      : 0;
 
     const rawStartMs = anchorEndMs + cue.timing.offsetMs;
     const startMs = Math.max(0, Math.round(rawStartMs));
@@ -175,16 +214,76 @@ export function resolveTimeline(
   });
 
   const contentEndMs = Math.max(
-    0,
+    leadInMs,
     ...resolvedCues.map((c) => c.endMs),
     ...resolvedSfx.map((s) => s.endMs),
   );
   const tailMs = project.audio.tailMs ?? 2000;
   const totalDurationMs = contentEndMs + tailMs;
 
+  // Resolve cue-anchored or raw-ms bed spans
+  const resolvedBeds: ResolvedBedTiming[] = (project.beds ?? []).map((bed: BedTrack) => {
+    let rawStartMs: number;
+    if (bed.startCueId != null) {
+      const startCue = resolvedMap.get(bed.startCueId);
+      if (!startCue) {
+        throw new TimelineError(
+          `Bed "${bed.id}" references unknown startCueId "${bed.startCueId}"`,
+        );
+      }
+      const edge = bed.startEdge ?? 'start';
+      const anchorTimeMs = edge === 'end' ? startCue.endMs : startCue.startMs;
+      rawStartMs = anchorTimeMs + (bed.startOffsetMs ?? 0);
+    } else {
+      rawStartMs = bed.startMs ?? 0;
+    }
+
+    const startMs = Math.max(0, Math.round(rawStartMs));
+    if (rawStartMs < 0) {
+      warnings.push(
+        `Bed "${bed.id}" start resolved to ${rawStartMs} ms and was clamped to 0 ms.`,
+      );
+    }
+
+    let rawEndMs: number;
+    if (bed.endCueId != null) {
+      const endCue = resolvedMap.get(bed.endCueId);
+      if (!endCue) {
+        throw new TimelineError(
+          `Bed "${bed.id}" references unknown endCueId "${bed.endCueId}"`,
+        );
+      }
+      const edge = bed.endEdge ?? 'end';
+      const anchorTimeMs = edge === 'start' ? endCue.startMs : endCue.endMs;
+      rawEndMs = anchorTimeMs + (bed.endOffsetMs ?? 0);
+    } else if (bed.endMs != null) {
+      rawEndMs = bed.endMs;
+    } else {
+      rawEndMs = totalDurationMs;
+    }
+
+    const clampedEnd = Math.min(totalDurationMs, Math.round(rawEndMs));
+    const endMs = Math.max(startMs, clampedEnd);
+    if (clampedEnd < startMs) {
+      warnings.push(
+        `Bed "${bed.id}" end (${clampedEnd} ms) precedes start (${startMs} ms); duration clamped to 0 ms.`,
+      );
+    }
+
+    return {
+      bedId: bed.id,
+      label: bed.label,
+      startMs,
+      endMs,
+      durationMs: Math.max(0, endMs - startMs),
+    };
+  });
+
   return {
     cues: resolvedCues,
     sfx: resolvedSfx,
+    beds: resolvedBeds,
+    leadInMs,
     contentEndMs,
     tailMs,
     totalDurationMs,

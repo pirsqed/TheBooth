@@ -88,6 +88,14 @@ const UpsertBedBodySchema = z.object({
   loop: z.boolean().default(true),
   startMs: z.number().int().min(0).optional(),
   endMs: z.number().int().min(0).nullable().optional(),
+  startCueId: z.string().nullable().optional(),
+  startEdge: z.enum(['start', 'end']).optional(),
+  startOffsetMs: z.number().int().optional(),
+  endCueId: z.string().nullable().optional(),
+  endEdge: z.enum(['start', 'end']).optional(),
+  endOffsetMs: z.number().int().optional(),
+  clipStartMs: z.number().int().min(0).optional(),
+  clipDurationMs: z.number().int().positive().optional(),
   fadeInMs: z.number().int().min(0).max(30000).default(1500),
   fadeOutMs: z.number().int().min(0).max(30000).default(3000),
   ducking: BedDuckingSchema.default({
@@ -104,13 +112,33 @@ const UpsertSfxBodySchema = z.object({
   anchor: SfxAnchorSchema.default({ edge: 'end', offsetMs: 0 }),
   gainDb: z.number().min(-48).max(12).default(-6),
   pan: z.number().min(-1).max(1).default(0),
+  clipStartMs: z.number().int().min(0).optional(),
+  clipDurationMs: z.number().int().positive().optional(),
   fadeInMs: z.number().int().min(0).max(5000).default(15),
   fadeOutMs: z.number().int().min(0).max(5000).default(40),
 });
 
+const IndexAssetsBodySchema = z
+  .object({
+    mounts: z.array(z.string().min(1)).optional(),
+    forceReprobe: z.boolean().optional(),
+    concurrency: z.number().int().min(1).max(16).optional(),
+    enrichCaptions: z.boolean().optional(),
+    maxCaptionCount: z.number().int().min(1).max(500).optional(),
+    onlyMissingDescriptions: z.boolean().optional(),
+    enrichEmbeddings: z.boolean().optional(),
+    wait: z.boolean().optional(),
+  })
+  .optional();
+
 const MixBodySchema = z
   .object({
-    format: ExportFormatSchema.default('ogg'),
+    format: ExportFormatSchema.optional(),
+    outputPath: z.string().min(1).optional(),
+    fromCueId: SafeIdSchema.optional(),
+    toCueId: SafeIdSchema.optional(),
+    startSec: z.number().min(0).optional(),
+    endSec: z.number().positive().optional(),
   })
   .optional();
 
@@ -157,6 +185,9 @@ const AuditionVoiceBodySchema = z.object({
   notes: z.string().optional(),
   provider: z.string().min(1).optional(),
   model: z.string().min(1).optional(),
+  renderReel: z.boolean().optional(),
+  reelFormat: ExportFormatSchema.optional(),
+  reelOutputPath: z.string().min(1).optional(),
 });
 
 const DirectCueBodySchema = z
@@ -213,7 +244,8 @@ export function registerRoutes(app: FastifyInstance, service: StudioService): vo
       beds: 'PUT /projects/:id/beds/:bedId | DELETE /projects/:id/beds/:bedId',
       sfx: 'PUT /projects/:id/sfx/:sfxId | DELETE /projects/:id/sfx/:sfxId',
       mix: 'POST /projects/:id/mix | GET /projects/:id/exports/:exportId/audio',
-      assets: 'GET /assets | POST /assets | PUT /assets/* | DELETE /assets/*',
+      assets:
+        'GET /assets | POST /assets | PUT /assets/* | DELETE /assets/* | POST /assets/index | GET /assets/search | GET /assets/audio',
       casting:
         'GET /providers/:provider/voices | GET /providers/:provider/voices/:voiceId | GET /providers/:provider/voices/:voiceId/preview | DELETE /providers/:provider/voices/:voiceId | POST /voices/design | POST /projects/:id/voices/:voiceId/audition | POST /projects/:id/voices/:voiceId/auditions/:auditionId/select',
       director:
@@ -290,6 +322,23 @@ export function registerRoutes(app: FastifyInstance, service: StudioService): vo
     '/projects/:id/cues/:cueId',
     async (req) => {
       return service.deleteCue(req.params.id, req.params.cueId);
+    },
+  );
+
+  const SplitCueBodySchema = z.object({
+    atMs: z.number().int().min(50),
+    gapMs: z.number().int().min(-5000).max(60000).optional(),
+    secondCueId: SafeIdSchema.optional(),
+    textBefore: z.string().min(1).optional(),
+    textAfter: z.string().min(1).optional(),
+  });
+
+  app.post<{ Params: { id: string; cueId: string } }>(
+    '/projects/:id/cues/:cueId/split',
+    async (req, reply) => {
+      const body = SplitCueBodySchema.parse(req.body);
+      const result = await service.splitCue(req.params.id, req.params.cueId, body);
+      return reply.code(201).send(result);
     },
   );
 
@@ -380,11 +429,23 @@ export function registerRoutes(app: FastifyInstance, service: StudioService): vo
 
   // --- Mixdown (Stage 2) ---
   app.post<{ Params: { id: string } }>('/projects/:id/mix', async (req) => {
-    const body = MixBodySchema.parse(req.body) ?? { format: 'ogg' as const };
-    const { exportRecord, telemetry } = await service.mixProject(req.params.id, {
-      format: body.format,
-    });
-    return { export: exportRecord, telemetry };
+    const body = MixBodySchema.parse(req.body) ?? {};
+    const { exportRecord, telemetry, deliveredPath } = await service.mixProject(
+      req.params.id,
+      {
+        format: body.format,
+        outputPath: body.outputPath,
+        fromCueId: body.fromCueId,
+        toCueId: body.toCueId,
+        startSec: body.startSec,
+        endSec: body.endSec,
+      },
+    );
+    return {
+      export: exportRecord,
+      telemetry,
+      ...(deliveredPath ? { deliveredPath } : {}),
+    };
   });
 
   app.get<{ Params: { id: string; exportId: string } }>(
@@ -544,8 +605,100 @@ export function registerRoutes(app: FastifyInstance, service: StudioService): vo
 
   // --- Shared Asset Library ---
   app.get('/assets', async () => {
-    const assets = await service.listAssets();
-    return { assets };
+    const [assets, mounts] = await Promise.all([
+      service.listAssets(),
+      service.listAssetMountsSummary(),
+    ]);
+    return { assets, mounts };
+  });
+
+  app.post('/assets/index', async (req, reply) => {
+    const body = IndexAssetsBodySchema.parse(req.body) ?? {};
+    const { wait, ...opts } = body;
+    const { job, done } = await service.startIndexAssets(opts);
+    if (wait === false) {
+      done.catch(() => {});
+      return reply.code(202).send({ jobId: job.id, job });
+    }
+    const finished = await done;
+    return reply.code(200).send({
+      jobId: finished.job.id,
+      job: finished.job,
+      summary: finished.summary,
+    });
+  });
+
+  app.get<{ Querystring: Record<string, unknown> }>('/assets/search', async (req) => {
+    const q = req.query ?? {};
+    const query = typeof (q.query ?? q.q) === 'string' ? String(q.query ?? q.q) : '';
+    const rawKind = typeof q.kind === 'string' ? q.kind.toLowerCase() : 'any';
+    if (rawKind !== 'sfx' && rawKind !== 'bed' && rawKind !== 'any') {
+      throw new StoreError(`Invalid kind "${rawKind}" (expected sfx, bed, or any)`, 400);
+    }
+    const parseOptNum = (v: unknown, label: string): number | undefined => {
+      if (v === undefined || v === null || v === '') return undefined;
+      const n = Number(v);
+      if (!Number.isFinite(n) || n < 0) {
+        throw new StoreError(`Invalid ${label}: "${v}"`, 400);
+      }
+      return n;
+    };
+    const stereoOnly =
+      q.stereoOnly === true || q.stereoOnly === 'true' || q.stereoOnly === '1';
+
+    return service.searchAssets({
+      query,
+      kind: rawKind,
+      mount: typeof q.mount === 'string' && q.mount.trim() ? q.mount.trim() : undefined,
+      minDurationSec: parseOptNum(q.minDurationSec, 'minDurationSec'),
+      maxDurationSec: parseOptNum(q.maxDurationSec, 'maxDurationSec'),
+      stereoOnly: stereoOnly || undefined,
+      limit: parseOptNum(q.limit, 'limit'),
+    });
+  });
+
+  app.get<{ Querystring: Record<string, unknown> }>('/assets/audio', async (req, reply) => {
+    const q = req.query ?? {};
+    const assetPath = typeof q.assetPath === 'string' ? q.assetPath.trim() : '';
+    if (!assetPath) {
+      throw new StoreError('Query parameter "assetPath" is required', 400);
+    }
+    const startSec =
+      q.startSec !== undefined && q.startSec !== '' ? Number(q.startSec) : undefined;
+    const maxDurationSec =
+      q.maxDurationSec !== undefined && q.maxDurationSec !== ''
+        ? Number(q.maxDurationSec)
+        : undefined;
+    if (startSec !== undefined && (!Number.isFinite(startSec) || startSec < 0)) {
+      throw new StoreError(`Invalid startSec: "${q.startSec}"`, 400);
+    }
+    if (
+      maxDurationSec !== undefined &&
+      (!Number.isFinite(maxDurationSec) || maxDurationSec <= 0)
+    ) {
+      throw new StoreError(`Invalid maxDurationSec: "${q.maxDurationSec}"`, 400);
+    }
+
+    const preview = await service.getAssetAudio({
+      assetPath,
+      startSec,
+      maxDurationSec,
+    });
+
+    if (q.format === 'json') {
+      const { audioBuffer, ...meta } = preview;
+      return {
+        ...meta,
+        audioBase64: audioBuffer.toString('base64'),
+      };
+    }
+
+    reply.header('Content-Type', preview.mimeType);
+    reply.header('X-Booth-Asset-Path', preview.assetPath);
+    reply.header('X-Booth-Total-Duration-Sec', String(preview.totalDurationSec));
+    reply.header('X-Booth-Preview-Start-Sec', String(preview.previewStartSec));
+    reply.header('X-Booth-Preview-Duration-Sec', String(preview.previewDurationSec));
+    return reply.send(preview.audioBuffer);
   });
 
   app.post('/assets', async (req, reply) => {
@@ -710,6 +863,50 @@ export function registerRoutes(app: FastifyInstance, service: StudioService): vo
         req.params.auditionId,
       );
       return { voice };
+    },
+  );
+
+  const AuditionReelBodySchema = z
+    .object({
+      auditionIds: z.array(SafeIdSchema).min(1).max(10).optional(),
+      format: ExportFormatSchema.optional(),
+      outputPath: z.string().min(1).optional(),
+    })
+    .optional();
+
+  app.post<{ Params: { id: string; voiceId: string } }>(
+    '/projects/:id/voices/:voiceId/auditions/reel',
+    async (req, reply) => {
+      const body = AuditionReelBodySchema.parse(req.body) ?? {};
+      const reel = await service.renderAuditionReel(
+        req.params.id,
+        req.params.voiceId,
+        body,
+      );
+      return reply.code(201).send(reel);
+    },
+  );
+
+  const TakeAbReelBodySchema = z
+    .object({
+      takeIds: z.array(SafeIdSchema).min(1).max(6).optional(),
+      contextBeforeCues: z.number().int().min(0).max(3).optional(),
+      contextAfterCues: z.number().int().min(0).max(2).optional(),
+      format: ExportFormatSchema.optional(),
+      outputPath: z.string().min(1).optional(),
+    })
+    .optional();
+
+  app.post<{ Params: { id: string; cueId: string } }>(
+    '/projects/:id/cues/:cueId/ab-reel',
+    async (req, reply) => {
+      const body = TakeAbReelBodySchema.parse(req.body) ?? {};
+      const reel = await service.renderTakeComparisonReel(
+        req.params.id,
+        req.params.cueId,
+        body,
+      );
+      return reply.code(201).send(reel);
     },
   );
 

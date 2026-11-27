@@ -1,6 +1,6 @@
 import * as crypto from 'node:crypto';
 
-export type JobKind = 'render_all' | 'mix' | 'direct_project';
+export type JobKind = 'render_all' | 'mix' | 'direct_project' | 'index_assets';
 export type JobStatus = 'queued' | 'running' | 'completed' | 'failed';
 
 export interface JobErrorItem {

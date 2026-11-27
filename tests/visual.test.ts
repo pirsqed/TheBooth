@@ -6,6 +6,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { buildServer } from '../src/api/server.js';
 import { createMcpServer } from '../src/mcp/server.js';
+import { wrapPcm16AsWav } from '../src/providers/interface.js';
 import { MockTtsProvider } from '../src/providers/mock.js';
 import { StudioService } from '../src/studio/service.js';
 import { ProjectStore } from '../src/studio/store.js';
@@ -100,7 +101,9 @@ describe('Visual-Audio Inspection (booth_inspect_visual)', () => {
     expect(fast.panels).toEqual(['waveform', 'spectrogram']);
     expect(readPngDimensions(fast.pngBuffer)).toEqual({ width: 1600, height: 900 });
 
-    // 3) Take visual without passing cueId (auto-resolved from takeId)
+    // 3) Take visual without passing cueId (auto-resolved from takeId) - both master & fast
+    // Raw takes are 24 kHz mono WAVs, which used to trigger an FFmpeg vstack width mismatch
+    // (1584 vs 1600) in preset="fast" before resampling to 48 kHz stereo.
     const firstTakeId = project.cues[0]!.activeTakeId!;
     const takeVis = await service.inspectVisual({
       projectId: project.id,
@@ -108,6 +111,16 @@ describe('Visual-Audio Inspection (booth_inspect_visual)', () => {
     });
     expect(takeVis.panels).toEqual(['waveform', 'rms', 'spectrogram']);
     expect(readPngDimensions(takeVis.pngBuffer)).toEqual({ width: 1600, height: 900 });
+
+    const takeVisFast = await service.inspectVisual({
+      projectId: project.id,
+      target: { type: 'take', takeId: firstTakeId },
+      preset: 'fast',
+    });
+    expect(takeVisFast.preset).toBe('fast');
+    expect(takeVisFast.channels).toBe(1);
+    expect(takeVisFast.sampleRate).toBe(24000);
+    expect(readPngDimensions(takeVisFast.pngBuffer)).toEqual({ width: 1600, height: 900 });
   });
 
   it('enforces zoom <= 45s cap and warns below 30 px/s in overview mode', async () => {
@@ -200,5 +213,66 @@ describe('Visual-Audio Inspection (booth_inspect_visual)', () => {
       await client.close();
       await mcpServer.close();
     }
+  });
+
+  it('renders dedicated SFX overlay lane and aligns DAW cues/SFX for scene-scoped partial exports', async () => {
+    const { service, project } = await setupStudio();
+
+    // Add a short SFX asset and anchor it to cue 2
+    const samples = Math.round(0.4 * 48000);
+    const pcm = Buffer.alloc(samples * 2);
+    for (let i = 0; i < samples; i++) {
+      pcm.writeInt16LE(Math.round(Math.sin((2 * Math.PI * 520 * i) / 48000) * 12000), i * 2);
+    }
+    await service.uploadAsset({
+      assetPath: 'door_latch.wav',
+      buffer: wrapPcm16AsWav(pcm, 48000, 1),
+    });
+    const cue2Id = project.cues[1]!.id;
+    await service.upsertSfx(project.id, 'latch_click', {
+      label: 'Door Latch',
+      assetPath: 'door_latch.wav',
+      anchor: { cueId: cue2Id, edge: 'start', offsetMs: 100 },
+      gainDb: -6,
+      pan: 0.4,
+      fadeInMs: 15,
+      fadeOutMs: 40,
+    });
+
+    // Full export visual includes SFX lane telemetry
+    const fullMix = await service.mixProject(project.id, { format: 'wav' });
+    const fullVis = await service.inspectVisual({
+      projectId: project.id,
+      target: { type: 'export', exportId: fullMix.exportRecord.id },
+      preset: 'master',
+    });
+    expect(readPngDimensions(fullVis.pngBuffer)).toEqual({ width: 1600, height: 900 });
+    expect(fullVis.summaryTelemetry.sfxCount).toBe(1);
+    const sfxInWin = fullVis.summaryTelemetry.sfxInWindow as Array<{ id: string; startSec: number }>;
+    expect(sfxInWin).toHaveLength(1);
+    expect(sfxInWin[0]!.id).toBe('latch_click');
+    expect(sfxInWin[0]!.startSec).toBeGreaterThan(1.0);
+
+    // Partial export scoped to cue 2 only: DAW cues & SFX coordinates rebase to 0s!
+    const partialMix = await service.mixProject(project.id, {
+      format: 'wav',
+      fromCueId: cue2Id,
+      toCueId: cue2Id,
+    });
+    const partialVis = await service.inspectVisual({
+      projectId: project.id,
+      target: { type: 'export', exportId: partialMix.exportRecord.id },
+      preset: 'master',
+    });
+    expect(readPngDimensions(partialVis.pngBuffer)).toEqual({ width: 1600, height: 900 });
+    expect(partialVis.summaryTelemetry.window).toBeDefined();
+    const partialCues = partialVis.summaryTelemetry.cuesInWindow as Array<{ id: string; startSec: number }>;
+    expect(partialCues).toHaveLength(1);
+    expect(partialCues[0]!.id).toBe(cue2Id);
+    expect(partialCues[0]!.startSec).toBeCloseTo(0, 2);
+    const partialSfx = partialVis.summaryTelemetry.sfxInWindow as Array<{ id: string; startSec: number }>;
+    expect(partialSfx).toHaveLength(1);
+    expect(partialSfx[0]!.id).toBe('latch_click');
+    expect(partialSfx[0]!.startSec).toBeCloseTo(0.1, 1);
   });
 });

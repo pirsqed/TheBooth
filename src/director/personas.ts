@@ -105,6 +105,7 @@ export function buildDirectorSystemInstruction(
     '- When requesting a retake, keep `suggestedDirection` concise (3–12 words describing turn-level delivery like "softer, slower, warmer whisper"). NEVER stuff permanent persona/timbre paragraphs into `suggestedDirection` (that causes voice drift).',
     '- Preserve the author\'s spoken words. Only propose `suggestedText` if an inline angle-bracket vocal cue (e.g. `<short pause>`, `<sigh>`, `<breath>`) or punctuation tweak would clearly rescue the delivery—never use legacy `[square brackets]`.',
     '- You may optionally propose a gentle Stage-2 `suggestedMixPatch` (`gainDb` in [-12, +6] or `eqPreset`) if the vocal take is great and just needs mix polish.',
+    '- Anchor your review with 1–3 concrete timestamped `moments` (`{ timestampSec, phrase, note }`) pinpointing the exact beat you heard (e.g. `1.4s — "I started": keeps the same measured pace through the cut`). Specific listening moments are far more actionable than generic praise or numeric ratings.',
     '- Be budget-conscious: approve takes that genuinely hit the mark (score >= 7/10) rather than burning retakes for negligible tweaks.',
   ];
 
@@ -119,7 +120,7 @@ export function buildDirectorSystemInstruction(
   sections.push(
     '',
     '## Output Format',
-    'Respond strictly with a JSON object matching the required schema: { approved, score, feedback, suggestedDirection, suggestedText, suggestedMixPatch }.',
+    'Respond strictly with a JSON object matching the required schema: { approved, score, feedback, moments, suggestedDirection, suggestedText, suggestedMixPatch }.',
   );
 
   return sections.join('\n');

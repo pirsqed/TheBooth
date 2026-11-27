@@ -6,10 +6,21 @@ export const DirectorMixPatchSchema = z.object({
   eqPreset: EqPresetSchema.optional(),
 });
 
+export const DirectorMomentSchema = z.object({
+  /** Approximate timestamp in seconds inside this take where the moment occurred */
+  timestampSec: z.number().min(0),
+  /** Optional short quoted phrase or word heard at this moment (e.g. "I started") */
+  phrase: z.string().min(1).nullable().optional(),
+  /** Concrete directing observation at this moment */
+  note: z.string().min(1),
+});
+export type DirectorMoment = z.infer<typeof DirectorMomentSchema>;
+
 export const DirectorReviewVerdictSchema = z.object({
   approved: z.boolean(),
   score: z.number().min(1).max(10),
   feedback: z.string().min(1),
+  moments: z.array(DirectorMomentSchema).optional(),
   suggestedDirection: z.string().nullable().optional(),
   suggestedText: z.string().nullable().optional(),
   suggestedMixPatch: DirectorMixPatchSchema.nullable().optional(),
@@ -60,9 +71,15 @@ export interface CueDirectResult {
   cueId: string;
   approved: boolean;
   selectedTakeId: string;
-  bestScore: number;
+  /** Decision-first summary of what the director heard */
+  observation: string;
+  /** What changed across retakes / mix adjustments */
+  changeSummary: string;
+  /** Key timestamped listening moments from the review */
+  moments: DirectorMoment[];
   retakesUsed: number;
   personaUsed: string;
+  bestScore: number;
   attempts: CueDirectAttempt[];
 }
 

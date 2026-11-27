@@ -22,6 +22,15 @@ export interface VisualCueBlock {
   gainDb?: number;
 }
 
+export interface VisualSfxBlock {
+  id: string;
+  label: string;
+  startSec: number;
+  endSec: number;
+  pan: number;
+  gainDb?: number;
+}
+
 export interface RenderVisualOptions {
   audioPath: string;
   ffmpegPath?: string;
@@ -36,6 +45,8 @@ export interface RenderVisualOptions {
   panels?: VisualPanel[];
   /** Timeline cue spans for DAW Cue Overlay (Panel 1) */
   cueBlocks?: VisualCueBlock[];
+  /** Timeline SFX spans for the dedicated SFX lane in DAW Cue Overlay (Panel 1) */
+  sfxBlocks?: VisualSfxBlock[];
   /** Neutral or descriptive chart title */
   title?: string;
   width?: number;
@@ -597,12 +608,14 @@ function renderMasterSvgToPng(params: {
   endSec: number;
   panels: VisualPanel[];
   cueBlocks: VisualCueBlock[];
+  sfxBlocks: VisualSfxBlock[];
   title: string;
   width: number;
   height: number;
 }): { pngBuffer: Buffer; plotW: number } {
-  const { left, right, startSec, endSec, panels, cueBlocks, title, width, height } = params;
+  const { left, right, startSec, endSec, panels, cueBlocks, sfxBlocks, title, width, height } = params;
   const spanSec = Math.max(0.05, endSec - startSec);
+  const hasSfxLane = sfxBlocks.length > 0;
 
   const marginLeft = 104;
   const marginRight =
@@ -615,7 +628,7 @@ function renderMasterSvgToPng(params: {
 
   // Allocate vertical heights proportionally by enabled panels
   const weights: Record<VisualPanel, number> = {
-    cues: 11,
+    cues: hasSfxLane ? 15 : 11,
     waveform: 26,
     rms: 20,
     spectrogram: 43,
@@ -685,7 +698,7 @@ function renderMasterSvgToPng(params: {
     }
   };
 
-  // --- Panel 1: DAW Cue-Block Track (A2) ---
+  // --- Panel 1: DAW Cue-Block & SFX Overlay Track (A2) ---
   const cuesBox = layout.get('cues');
   if (cuesBox) {
     svg.push(
@@ -694,8 +707,13 @@ function renderMasterSvgToPng(params: {
     pushTimeGrid(cuesBox.y, cuesBox.h);
 
     const visibleCues = cueBlocks.filter((c) => c.endSec > startSec && c.startSec < endSec);
-    const laneH = Math.max(18, Math.floor((cuesBox.h - 14) / 2));
-    const laneTops = [cuesBox.y + 5, cuesBox.y + 5 + laneH + 4];
+    const visibleSfx = sfxBlocks.filter((s) => s.endSec > startSec && s.startSec < endSec);
+    const laneCount = hasSfxLane ? 3 : 2;
+    const laneH = Math.max(16, Math.floor((cuesBox.h - (laneCount === 3 ? 20 : 14)) / laneCount));
+    const laneTops =
+      laneCount === 3
+        ? [cuesBox.y + 4, cuesBox.y + 4 + laneH + 4, cuesBox.y + 4 + (laneH + 4) * 2 + 2]
+        : [cuesBox.y + 5, cuesBox.y + 5 + laneH + 4];
 
     svg.push(
       `<text x="${plotX - 10}" y="${laneTops[0]! + laneH / 2 + 4}" text-anchor="end" fill="#9ba7b4" font-family="Arial, sans-serif" font-size="11">Lane A</text>`,
@@ -703,8 +721,17 @@ function renderMasterSvgToPng(params: {
     svg.push(
       `<text x="${plotX - 10}" y="${laneTops[1]! + laneH / 2 + 4}" text-anchor="end" fill="#9ba7b4" font-family="Arial, sans-serif" font-size="11">Lane B</text>`,
     );
+    if (hasSfxLane) {
+      const dividerY = laneTops[2]! - 3;
+      svg.push(
+        `<line x1="${plotX}" y1="${dividerY}" x2="${plotX + plotW}" y2="${dividerY}" stroke="#2a3444" stroke-width="1"/>`,
+      );
+      svg.push(
+        `<text x="${plotX - 10}" y="${laneTops[2]! + laneH / 2 + 4}" text-anchor="end" fill="#34d399" font-family="Arial, sans-serif" font-size="11" font-weight="700">SFX</text>`,
+      );
+    }
     svg.push(
-      `<text x="20" y="${(cuesBox.y + cuesBox.h / 2).toFixed(1)}" text-anchor="middle" fill="#e6edf3" font-family="Arial, sans-serif" font-size="12" font-weight="700" transform="rotate(-90 20 ${(cuesBox.y + cuesBox.h / 2).toFixed(1)})">DAW Cues</text>`,
+      `<text x="20" y="${(cuesBox.y + cuesBox.h / 2).toFixed(1)}" text-anchor="middle" fill="#e6edf3" font-family="Arial, sans-serif" font-size="12" font-weight="700" transform="rotate(-90 20 ${(cuesBox.y + cuesBox.h / 2).toFixed(1)})">${hasSfxLane ? 'DAW + SFX' : 'DAW Cues'}</text>`,
     );
 
     svg.push('<g clip-path="url(#clip_cues)">');
@@ -734,6 +761,33 @@ function renderMasterSvgToPng(params: {
         svg.push(
           `<text x="${(x1 + 6).toFixed(1)}" y="${(laneTops[laneIdx]! + laneH / 2 + 4).toFixed(1)}" fill="#f8fafc" font-family="Arial, sans-serif" font-size="11" font-weight="700">${escapeXml(label)}</text>`,
         );
+      }
+    }
+
+    if (hasSfxLane) {
+      const sfxY = laneTops[2]!;
+      for (const s of visibleSfx) {
+        const x1 = timeToX(Math.max(startSec, s.startSec));
+        const x2 = timeToX(Math.min(endSec, s.endSec));
+        const bw = Math.max(5, x2 - x1);
+        const isCenter = Math.abs(s.pan) <= 0.05;
+        const panTag = isCenter ? 'C' : `${s.pan > 0 ? '+' : ''}${s.pan.toFixed(2)}`;
+        const shortLbl = s.label.length > 20 ? `${s.label.slice(0, 19)}…` : s.label;
+
+        svg.push(
+          `<rect x="${x1.toFixed(1)}" y="${sfxY}" width="${bw.toFixed(1)}" height="${laneH}" rx="3" fill="#34d399" fill-opacity="0.34" stroke="#6ee7b7" stroke-opacity="0.92" stroke-width="1.2"/>`,
+        );
+        if (bw >= 36) {
+          const label =
+            bw >= 185
+              ? `${s.id} [${shortLbl}] pan=${panTag} (${s.startSec.toFixed(2)}-${s.endSec.toFixed(2)}s)`
+              : bw >= 95
+                ? `${s.id} [${shortLbl}] ${panTag}`
+                : s.id;
+          svg.push(
+            `<text x="${(x1 + 5).toFixed(1)}" y="${(sfxY + laneH / 2 + 4).toFixed(1)}" fill="#ecfdf5" font-family="Arial, sans-serif" font-size="10.5" font-weight="700">${escapeXml(label)}</text>`,
+          );
+        }
       }
     }
     svg.push('</g>');
@@ -945,13 +999,16 @@ async function renderFastFfmpegPng(params: {
   ffmpegPath: string;
 }): Promise<{ pngBuffer: Buffer; width: number; height: number; plotW: number }> {
   const { audioPath, startSec, durationSec, ffmpegPath } = params;
-  // Exact pixel-aligned 1600x900 layout: showspectrumpic(1316x522, legend=1) adds 142px left/right margins.
+  // Exact pixel-aligned 1600x900 layout: resample to 48 kHz stereo so showspectrumpic's
+  // legend width is deterministic across 8-96 kHz inputs (e.g. 24 kHz mono takes would
+  // otherwise produce 1584px and fail vstack against 1600px). Scale is a no-op at 1600x650
+  // and guards against FFmpeg version-specific legend margin differences.
   const fc = [
-    '[0:a]aformat=channel_layouts=stereo,asplit=2[a1][a2]',
+    '[0:a]aresample=48000,aformat=channel_layouts=stereo,asplit=2[a1][a2]',
     '[a1]showwavespic=s=1316x250:colors=#38bdf8|#fbbf24:split_channels=1:scale=lin:filter=peak[wraw]',
     'color=c=#0d1117:s=1600x250:d=1[bg]',
     '[bg][wraw]overlay=x=142:y=0:shortest=1,format=rgb24[w]',
-    '[a2]showspectrumpic=s=1316x522:mode=combined:color=magma:scale=log:fscale=log:gain=1:drange=100:legend=1,format=rgb24[s]',
+    '[a2]showspectrumpic=s=1316x522:mode=combined:color=magma:scale=log:fscale=log:gain=1:drange=100:legend=1,scale=1600:650,format=rgb24[s]',
     '[w][s]vstack=inputs=2[out]',
   ].join(';');
 
@@ -1033,8 +1090,9 @@ export async function renderAudioVisual(
   }
 
   const cueBlocks = options.cueBlocks ?? [];
+  const sfxBlocks = options.sfxBlocks ?? [];
   const defaultPanels: VisualPanel[] =
-    cueBlocks.length > 0
+    cueBlocks.length > 0 || sfxBlocks.length > 0
       ? ['cues', 'waveform', 'rms', 'spectrogram']
       : ['waveform', 'rms', 'spectrogram'];
   const panels: VisualPanel[] =
@@ -1077,6 +1135,7 @@ export async function renderAudioVisual(
       endSec,
       panels,
       cueBlocks,
+      sfxBlocks,
       title,
       width,
       height,

@@ -1,17 +1,25 @@
-import 'dotenv/config';
+import * as path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import dotenv from 'dotenv';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { loadConfig } from '../config.js';
 import { GeminiDirectorReviewer } from '../director/gemini.js';
 import { MockDirectorReviewer } from '../director/mock.js';
 import { GeminiTtsProvider } from '../providers/gemini.js';
 import { MockTtsProvider } from '../providers/mock.js';
+import { GeminiAssetEnricher } from '../studio/assets-index.js';
 import { StudioService } from '../studio/service.js';
 import { ProjectStore } from '../studio/store.js';
 import { createMcpServer } from './server.js';
 
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+dotenv.config({ path: path.join(REPO_ROOT, '.env'), quiet: true });
+
 async function main(): Promise<void> {
-  const config = loadConfig();
-  const store = new ProjectStore(config.dataDir);
+  const config = loadConfig(process.env, REPO_ROOT);
+  const store = new ProjectStore(config.dataDir, {
+    assetLibraryMounts: config.assetLibraryMounts,
+  });
   await store.ensureDataDirs();
 
   const geminiProvider = new GeminiTtsProvider({
@@ -26,6 +34,12 @@ async function main(): Promise<void> {
         model: config.geminiDirectorModel,
       })
     : new MockDirectorReviewer();
+  const assetEnricher = config.geminiApiKey
+    ? new GeminiAssetEnricher({
+        apiKey: config.geminiApiKey,
+        captionModel: config.geminiDirectorModel,
+      })
+    : undefined;
 
   const service = new StudioService({
     store,
@@ -35,9 +49,13 @@ async function main(): Promise<void> {
     },
     defaultProvider: config.geminiApiKey ? 'gemini' : 'mock',
     director,
+    assetEnricher,
+    geminiEmbeddingModel: config.geminiEmbeddingModel,
+    assetEmbeddingDims: config.assetEmbeddingDims,
     ffmpegPath: config.ffmpegPath,
     ffprobePath: config.ffprobePath,
     allowCustomFfmpegFilter: config.allowCustomFfmpegFilter,
+    allowedExportDirs: config.allowedExportDirs,
   });
 
   const server = createMcpServer(service);

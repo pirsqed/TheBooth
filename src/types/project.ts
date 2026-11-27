@@ -35,12 +35,14 @@ export const ProjectAudioSettingsSchema = z.object({
   masterTargetLufs: z.number().min(-36).max(-6).default(-18),
   truePeakCeilingDb: z.number().min(-6).max(0).default(-1.5),
   headphoneCrossfeed: z.boolean().default(true),
+  leadInMs: z.number().int().min(0).max(30000).default(0),
   tailMs: z.number().int().min(0).max(30000).default(2000),
 });
 export type ProjectAudioSettings = z.infer<typeof ProjectAudioSettingsSchema>;
 
 export const VoiceAuditionSchema = z.object({
   id: SafeIdSchema,
+  label: z.string().min(1).optional(),
   providerVoiceId: z.string().min(1),
   sampleText: z.string().min(1),
   audioPath: z.string().min(1),
@@ -85,6 +87,21 @@ export const CueTimingSchema = z.object({
 });
 export type CueTiming = z.infer<typeof CueTimingSchema>;
 
+export const CueTrimSchema = z
+  .object({
+    startMs: z.number().int().min(0).optional(),
+    endMs: z.number().int().min(0).nullable().optional(),
+  })
+  .refine(
+    (t) =>
+      t.startMs === undefined ||
+      t.endMs === undefined ||
+      t.endMs === null ||
+      t.endMs > t.startMs,
+    { message: 'trim.endMs must be greater than trim.startMs' },
+  );
+export type CueTrim = z.infer<typeof CueTrimSchema>;
+
 export const CueMixSchema = z.object({
   autoLevel: AutoLevelModeSchema.optional(),
   gainDb: z.number().min(-24).max(12).default(0),
@@ -92,6 +109,7 @@ export const CueMixSchema = z.object({
   eqPreset: EqPresetSchema.default('neutral'),
   fadeInMs: z.number().int().min(0).max(10000).default(20),
   fadeOutMs: z.number().int().min(0).max(10000).default(30),
+  trim: CueTrimSchema.optional(),
   customFfmpegFilter: z.string().optional(),
 });
 export type CueMix = z.infer<typeof CueMixSchema>;
@@ -127,6 +145,14 @@ export const BedTrackSchema = z
     loop: z.boolean().default(true),
     startMs: z.number().int().min(0).optional(),
     endMs: z.number().int().min(0).nullable().optional(),
+    startCueId: z.string().nullable().optional(),
+    startEdge: z.enum(['start', 'end']).optional(),
+    startOffsetMs: z.number().int().optional(),
+    endCueId: z.string().nullable().optional(),
+    endEdge: z.enum(['start', 'end']).optional(),
+    endOffsetMs: z.number().int().optional(),
+    clipStartMs: z.number().int().min(0).optional(),
+    clipDurationMs: z.number().int().positive().optional(),
     fadeInMs: z.number().int().min(0).max(30000).default(1500),
     fadeOutMs: z.number().int().min(0).max(30000).default(3000),
     ducking: BedDuckingSchema,
@@ -156,10 +182,20 @@ export const SfxEventSchema = z.object({
   anchor: SfxAnchorSchema.default({ edge: 'end', offsetMs: 0 }),
   gainDb: z.number().min(-48).max(12).default(-6),
   pan: z.number().min(-1).max(1).default(0),
+  clipStartMs: z.number().int().min(0).optional(),
+  clipDurationMs: z.number().int().positive().optional(),
   fadeInMs: z.number().int().min(0).max(5000).default(15),
   fadeOutMs: z.number().int().min(0).max(5000).default(40),
 });
 export type SfxEvent = z.infer<typeof SfxEventSchema>;
+
+export const MixExportWindowSchema = z.object({
+  startMs: z.number().min(0),
+  endMs: z.number().min(0),
+  fromCueId: z.string().optional(),
+  toCueId: z.string().optional(),
+});
+export type MixExportWindow = z.infer<typeof MixExportWindowSchema>;
 
 export const MixExportSchema = z.object({
   id: SafeIdSchema,
@@ -171,6 +207,7 @@ export const MixExportSchema = z.object({
   truePeakDbtp: z.number(),
   sampleRate: z.number().int(),
   channels: z.number().int(),
+  window: MixExportWindowSchema.optional(),
   warnings: z.array(z.string()).default([]),
   createdAt: z.string(),
 });

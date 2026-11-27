@@ -40,19 +40,42 @@ import {
   listDirectorPersonas,
   resolveDirectorPersona,
 } from '../director/personas.js';
-import { measureAudioLoudness, probeAudio } from '../audio/ffmpeg.js';
-import { MixdownTelemetry, runMixdown } from '../audio/mixdown.js';
-import { ResolvedTimeline, resolveTimeline } from '../audio/timeline.js';
+import { measureAudioLoudness, probeAudio, runCommand } from '../audio/ffmpeg.js';
+import {
+  MixdownTelemetry,
+  computeEffectiveClipSpan,
+  runMixdown,
+} from '../audio/mixdown.js';
+import {
+  RenderedReelEntry,
+  indexToReelLabel,
+  renderComparisonReel,
+} from '../audio/reel.js';
+import {
+  ResolvedTimeline,
+  computeEffectiveTakeSpan,
+  getActiveTake,
+  resolveTimeline,
+} from '../audio/timeline.js';
 import {
   RenderVisualResult,
   VisualCueBlock,
   VisualMode,
   VisualPanel,
   VisualPreset,
+  VisualSfxBlock,
   VisualValidationError,
   renderAudioVisual,
 } from '../audio/visualize.js';
 import { parseScript } from '../script/parser.js';
+import {
+  AssetEnricher,
+  AssetIndexService,
+  AssetSearchOptions,
+  AssetSearchResult,
+  IndexAssetsOptions,
+  IndexAssetsSummary,
+} from './assets-index.js';
 import { JobTracker, StudioJob } from './jobs.js';
 import { AssetFileEntry, ProjectStore, StoreError } from './store.js';
 
@@ -61,10 +84,43 @@ export interface StudioServiceOptions {
   providers: Record<string, TtsProvider>;
   defaultProvider?: string;
   director?: DirectorReviewer;
+  assetEnricher?: AssetEnricher;
+  geminiEmbeddingModel?: string;
+  assetEmbeddingDims?: number;
   ffmpegPath?: string;
   ffprobePath?: string;
   allowCustomFfmpegFilter?: boolean;
+  allowedExportDirs?: string[];
   jobs?: JobTracker;
+}
+
+export interface AssetMountSummary {
+  alias: string;
+  readOnly: boolean;
+  indexedCount: number | null;
+}
+
+export interface GetAssetAudioOptions {
+  assetPath: string;
+  startSec?: number;
+  maxDurationSec?: number;
+}
+
+export interface AssetAudioPreviewResult {
+  assetPath: string;
+  filePath: string;
+  previewAudioPath: string;
+  mount: string;
+  readOnly: boolean;
+  totalDurationSec: number;
+  previewStartSec: number;
+  previewDurationSec: number;
+  channels: number;
+  sampleRate: number;
+  sizeBytes: number;
+  mimeType: string;
+  transcoded: boolean;
+  audioBuffer: Buffer;
 }
 
 export interface CreateProjectInput {
@@ -135,6 +191,18 @@ export interface AuditionVoiceInput {
   notes?: string;
   provider?: string;
   model?: string;
+  /** Render a playable labeled A/B comparison reel automatically when >= 2 candidates (default: true) */
+  renderReel?: boolean;
+  reelFormat?: ExportFormat;
+  reelOutputPath?: string;
+}
+
+export interface ComparisonReelSummary {
+  reelPath: string;
+  deliveredPath: string | null;
+  format: ExportFormat;
+  durationSec: number;
+  entries: RenderedReelEntry[];
 }
 
 export interface DesignedVoiceSummary {
@@ -167,12 +235,14 @@ export interface ProviderVoiceSummary extends ProviderVoiceEntry {
 export class StudioService {
   readonly store: ProjectStore;
   readonly jobs: JobTracker;
+  readonly assetIndex: AssetIndexService;
   private readonly providers: Record<string, TtsProvider>;
   private readonly defaultProvider: string;
   private readonly director?: DirectorReviewer;
   private readonly ffmpegPath: string;
   private readonly ffprobePath: string;
   private readonly allowCustomFfmpegFilter: boolean;
+  private readonly allowedExportDirs?: string[];
 
   constructor(options: StudioServiceOptions) {
     this.store = options.store;
@@ -183,7 +253,16 @@ export class StudioService {
     this.ffmpegPath = options.ffmpegPath ?? 'ffmpeg';
     this.ffprobePath = options.ffprobePath ?? 'ffprobe';
     this.allowCustomFfmpegFilter = options.allowCustomFfmpegFilter ?? false;
+    this.allowedExportDirs = options.allowedExportDirs?.map((d) => path.resolve(d));
     this.jobs = options.jobs ?? new JobTracker();
+    this.assetIndex = new AssetIndexService({
+      store: this.store,
+      ffmpegPath: this.ffmpegPath,
+      ffprobePath: this.ffprobePath,
+      enricher: options.assetEnricher,
+      embeddingModel: options.geminiEmbeddingModel,
+      embeddingDims: options.assetEmbeddingDims,
+    });
   }
 
   private getProvider(name: string): TtsProvider {
@@ -489,11 +568,151 @@ export class StudioService {
           evt.anchor.edge = fallbackAnchor ? 'end' : 'start';
         }
       }
+      // Re-anchor cue-anchored beds safely
+      for (const bed of current.beds) {
+        if (bed.startCueId === cueId) {
+          bed.startCueId = fallbackAnchor;
+        }
+        if (bed.endCueId === cueId) {
+          bed.endCueId = fallbackAnchor;
+        }
+      }
 
       current.cues.splice(idx, 1);
       resolveTimeline(current);
       return current;
     });
+  }
+
+  /**
+   * Non-destructively splits a rendered cue at `atMs` (relative to the cue's current
+   * playable start) into two sequential cues sharing the exact same immutable raw WAV take.
+   * Zero TTS re-synthesis: lets directors insert or adjust pauses/beats mid-line in Stage 2.
+   */
+  async splitCue(
+    projectId: string,
+    cueId: string,
+    input: {
+      atMs: number;
+      gapMs?: number;
+      secondCueId?: string;
+      textBefore?: string;
+      textAfter?: string;
+    },
+  ): Promise<{
+    project: Project;
+    firstCue: Cue;
+    secondCue: Cue;
+    splitAtRawMs: number;
+    gapMs: number;
+  }> {
+    const gapMs = Math.round(input.gapMs ?? 400);
+    const atMs = Math.round(input.atMs);
+    let firstCueOut!: Cue;
+    let secondCueOut!: Cue;
+    let splitAtRawMs = 0;
+
+    const project = await this.store.updateProject(projectId, (current) => {
+      const idx = current.cues.findIndex((c) => c.id === cueId);
+      if (idx === -1) {
+        throw new StoreError(`Cue not found: ${cueId}`, 404);
+      }
+      const cue = current.cues[idx]!;
+      const activeTake = getActiveTake(cue);
+      if (!activeTake) {
+        throw new StoreError(
+          `Cue "${cueId}" has no active take to split. Render a take first.`,
+          400,
+        );
+      }
+
+      const span = computeEffectiveTakeSpan(cue, activeTake);
+      if (span.durationMs < 120) {
+        throw new StoreError(
+          `Cue "${cueId}" playable duration (${span.durationMs} ms) is too short to split.`,
+          400,
+        );
+      }
+      if (atMs < 50 || atMs > span.durationMs - 50) {
+        throw new StoreError(
+          `atMs (${atMs} ms) must be between 50 ms and ${span.durationMs - 50} ms for cue "${cueId}".`,
+          400,
+        );
+      }
+
+      splitAtRawMs = span.trimStartMs + atMs;
+
+      const candidateId =
+        input.secondCueId ??
+        `${cue.id}_b_${crypto.randomBytes(2).toString('hex')}`;
+      if (current.cues.some((c) => c.id === candidateId)) {
+        throw new StoreError(`Cue ID already exists: ${candidateId}`, 409);
+      }
+
+      const origText = cue.text;
+      cue.text = input.textBefore?.trim() || origText;
+      cue.mix = {
+        ...cue.mix,
+        fadeOutMs: Math.min(cue.mix.fadeOutMs, 20),
+        trim: {
+          startMs: span.trimStartMs,
+          endMs: splitAtRawMs,
+        },
+      };
+
+      const secondCue: Cue = {
+        id: candidateId,
+        speaker: cue.speaker,
+        text: input.textAfter?.trim() || `${origText} (cont.)`,
+        direction: cue.direction,
+        timing: {
+          afterCueId: cue.id,
+          offsetMs: gapMs,
+        },
+        mix: {
+          ...cue.mix,
+          fadeInMs: Math.min(cue.mix.fadeInMs, 20),
+          fadeOutMs: 30,
+          trim: {
+            startMs: splitAtRawMs,
+            endMs: span.trimEndMs,
+          },
+        },
+        activeTakeId: cue.activeTakeId,
+        takes: cue.takes.map((t) => ({ ...t })),
+      };
+
+      for (const other of current.cues) {
+        if (other.id !== cue.id && other.timing.afterCueId === cue.id) {
+          other.timing.afterCueId = secondCue.id;
+        }
+      }
+      for (const s of current.sfx) {
+        if (s.anchor.cueId === cue.id && s.anchor.edge === 'end') {
+          s.anchor.cueId = secondCue.id;
+        }
+      }
+      for (const b of current.beds) {
+        if (b.endCueId === cue.id && b.endEdge !== 'start') {
+          b.endCueId = secondCue.id;
+        }
+      }
+
+      current.cues.splice(idx + 1, 0, secondCue);
+      resolveTimeline(current);
+
+      firstCueOut = cue;
+      secondCueOut = secondCue;
+      return current;
+    });
+
+    return {
+      project,
+      firstCue: firstCueOut,
+      secondCue: secondCueOut,
+      splitAtRawMs,
+      gapMs,
+    };
   }
 
   async upsertBed(
@@ -509,6 +728,7 @@ export class StudioService {
       } else {
         current.beds[idx] = entry;
       }
+      resolveTimeline(current);
       return current;
     });
   }
@@ -696,24 +916,26 @@ export class StudioService {
   > {
     let audioPath: string;
     let cueBlocks: VisualCueBlock[] = [];
+    let sfxBlocks: VisualSfxBlock[] = [];
     let targetSlug: string;
     let titlePrefix: string;
     let summaryTelemetry: Record<string, unknown>;
 
     if (input.target.type === 'asset') {
-      audioPath = this.store.resolveAssetPath(input.target.assetPath);
-      try {
-        await fs.access(audioPath);
-      } catch {
-        throw new StoreError(`Asset not found: ${input.target.assetPath}`, 404);
-      }
+      const resolvedAsset = await this.store.resolveExistingAssetFile(input.target.assetPath);
+      audioPath = resolvedAsset.absPath;
       targetSlug = `asset_${crypto
         .createHash('sha1')
-        .update(input.target.assetPath)
+        .update(resolvedAsset.canonicalPath)
         .digest('hex')
         .slice(0, 10)}`;
-      titlePrefix = `Asset ${input.target.assetPath}`;
-      summaryTelemetry = { targetType: 'asset', assetPath: input.target.assetPath };
+      titlePrefix = `Asset ${resolvedAsset.canonicalPath}`;
+      summaryTelemetry = {
+        targetType: 'asset',
+        assetPath: resolvedAsset.canonicalPath,
+        mount: resolvedAsset.mount,
+        readOnly: resolvedAsset.readOnly,
+      };
     } else {
       if (!input.projectId) {
         throw new StoreError('projectId is required for export, take, and audition targets', 400);
@@ -727,18 +949,69 @@ export class StudioService {
           throw new StoreError(`Export not found: ${exportId}`, 404);
         }
         audioPath = this.store.resolveProjectFile(input.projectId, exportRecord.audioPath);
-        const timeline = resolveTimeline(project);
-        cueBlocks = timeline.cues.map((rc) => {
-          const cueObj = project.cues.find((c) => c.id === rc.cueId);
-          return {
-            id: rc.cueId,
-            speaker: rc.speaker,
-            startSec: rc.startMs / 1000,
-            endSec: rc.endMs / 1000,
-            plannedPan: cueObj?.mix.pan ?? 0,
-            gainDb: cueObj?.mix.gainDb ?? 0,
-          };
-        });
+        const sfxDurationsMs: Record<string, number> = {};
+        const dummyWarnings: string[] = [];
+        for (const evt of project.sfx) {
+          try {
+            const resolvedAsset = await this.store.resolveExistingAssetFile(evt.assetPath);
+            const probed = await probeAudio(resolvedAsset.absPath, this.ffprobePath);
+            const clip = computeEffectiveClipSpan(
+              probed.durationMs,
+              evt.clipStartMs,
+              evt.clipDurationMs,
+              `SFX "${evt.id}"`,
+              dummyWarnings,
+            );
+            sfxDurationsMs[evt.id] = clip.durationMs;
+          } catch {
+            sfxDurationsMs[evt.id] = evt.clipDurationMs ?? 300;
+          }
+        }
+        const timeline = resolveTimeline(project, sfxDurationsMs);
+        const winStartSec = (exportRecord.window?.startMs ?? 0) / 1000;
+        const winEndSec =
+          exportRecord.window !== undefined
+            ? exportRecord.window.endMs / 1000
+            : Number.POSITIVE_INFINITY;
+
+        cueBlocks = timeline.cues
+          .map((rc) => {
+            const cueObj = project.cues.find((c) => c.id === rc.cueId);
+            return {
+              id: rc.cueId,
+              speaker: rc.speaker,
+              startSec: rc.startMs / 1000,
+              endSec: rc.endMs / 1000,
+              plannedPan: cueObj?.mix.pan ?? 0,
+              gainDb: cueObj?.mix.gainDb ?? 0,
+            };
+          })
+          .filter((c) => c.endSec > winStartSec && c.startSec < winEndSec)
+          .map((c) => ({
+            ...c,
+            startSec: Math.max(0, c.startSec - winStartSec),
+            endSec: Math.max(0, Math.min(c.endSec, winEndSec) - winStartSec),
+          }));
+
+        sfxBlocks = timeline.sfx
+          .map((rs, idx) => {
+            const evt = project.sfx[idx];
+            return {
+              id: rs.sfxId,
+              label: rs.label,
+              startSec: rs.startMs / 1000,
+              endSec: Math.max(rs.startMs / 1000 + 0.05, rs.endMs / 1000),
+              pan: evt?.pan ?? 0,
+              gainDb: evt?.gainDb ?? -6,
+            };
+          })
+          .filter((s) => s.endSec > winStartSec && s.startSec < winEndSec)
+          .map((s) => ({
+            ...s,
+            startSec: Math.max(0, s.startSec - winStartSec),
+            endSec: Math.max(0, Math.min(s.endSec, winEndSec) - winStartSec),
+          }));
+
         targetSlug = exportRecord.id;
         titlePrefix = `${project.id} / ${exportRecord.id}`;
         summaryTelemetry = {
@@ -749,6 +1022,8 @@ export class StudioService {
           integratedLufs: exportRecord.integratedLufs,
           truePeakDbtp: exportRecord.truePeakDbtp,
           cueCount: cueBlocks.length,
+          sfxCount: sfxBlocks.length,
+          ...(exportRecord.window ? { window: exportRecord.window } : {}),
         };
       } else if (input.target.type === 'take') {
         const { cueId, takeId } = input.target;
@@ -834,6 +1109,7 @@ export class StudioService {
         endSec: input.endSec,
         panels: input.panels,
         cueBlocks,
+        sfxBlocks,
         title: `${titlePrefix} | ${spanTag} (${preset})`,
       });
     } catch (err: unknown) {
@@ -843,7 +1119,7 @@ export class StudioService {
       throw err;
     }
 
-    // Add cues visible inside the rendered window for quick reference
+    // Add cues & SFX visible inside the rendered window for quick reference
     if (cueBlocks.length > 0) {
       summaryTelemetry.cuesInWindow = cueBlocks
         .filter((c) => c.endSec > rendered.startSec && c.startSec < rendered.endSec)
@@ -854,6 +1130,18 @@ export class StudioService {
           endSec: Number(c.endSec.toFixed(3)),
           plannedPan: c.plannedPan,
           gainDb: c.gainDb ?? 0,
+        }));
+    }
+    if (sfxBlocks.length > 0) {
+      summaryTelemetry.sfxInWindow = sfxBlocks
+        .filter((s) => s.endSec > rendered.startSec && s.startSec < rendered.endSec)
+        .map((s) => ({
+          id: s.id,
+          label: s.label,
+          startSec: Number(s.startSec.toFixed(3)),
+          endSec: Number(s.endSec.toFixed(3)),
+          pan: s.pan,
+          gainDb: s.gainDb ?? -6,
         }));
     }
 
@@ -983,40 +1271,399 @@ export class StudioService {
     return { job: finalJob, project: updatedProject };
   }
 
+  private async resolveDeliveryDestination(
+    rawOutputPath: string,
+    requestedFormat?: ExportFormat,
+  ): Promise<{ format: ExportFormat; targetPath: string; isDirectory: boolean }> {
+    const trimmed = rawOutputPath.trim();
+    if (!trimmed || trimmed.includes('\0')) {
+      throw new StoreError('Invalid outputPath', 400);
+    }
+
+    const trailingSep = /[\\/]$/.test(trimmed);
+    const resolved = path.resolve(trimmed);
+
+    let isDirectory = trailingSep;
+    if (!isDirectory) {
+      try {
+        const st = await fs.stat(resolved);
+        if (st.isDirectory()) {
+          isDirectory = true;
+        }
+      } catch {
+        // Does not exist yet; treat as file path unless it has a trailing separator
+      }
+    }
+
+    const extMap: Record<string, ExportFormat> = {
+      '.ogg': 'ogg',
+      '.wav': 'wav',
+      '.mp3': 'mp3',
+    };
+
+    let format: ExportFormat;
+    let targetPath: string;
+
+    if (isDirectory) {
+      format = requestedFormat ?? 'ogg';
+      targetPath = resolved;
+    } else {
+      const ext = path.extname(resolved).toLowerCase();
+      if (!ext) {
+        format = requestedFormat ?? 'ogg';
+        targetPath = `${resolved}.${format}`;
+      } else {
+        const inferred = extMap[ext];
+        if (!inferred) {
+          throw new StoreError(
+            `Unsupported outputPath extension "${ext}". Must be .ogg, .wav, .mp3, or a directory path.`,
+            400,
+          );
+        }
+        if (requestedFormat && requestedFormat !== inferred) {
+          throw new StoreError(
+            `outputPath extension "${ext}" does not match requested format "${requestedFormat}"`,
+            400,
+          );
+        }
+        format = requestedFormat ?? inferred;
+        targetPath = resolved;
+      }
+    }
+
+    if (this.allowedExportDirs && this.allowedExportDirs.length > 0) {
+      const withinAllowed = this.allowedExportDirs.some((root) => {
+        const rel = path.relative(root, targetPath);
+        return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+      });
+      if (!withinAllowed) {
+        throw new StoreError(
+          `outputPath "${targetPath}" is outside ALLOWED_EXPORT_DIRS`,
+          403,
+        );
+      }
+    }
+
+    return { format, targetPath, isDirectory };
+  }
+
+  private async atomicCopyFile(srcPath: string, destPath: string): Promise<void> {
+    const dir = path.dirname(destPath);
+    await fs.mkdir(dir, { recursive: true });
+    const tmpPath = path.join(
+      dir,
+      `${path.basename(destPath)}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`,
+    );
+    try {
+      await fs.copyFile(srcPath, tmpPath);
+      let lastErr: unknown;
+      for (let attempt = 0; attempt < 5; attempt++) {
+        try {
+          await fs.rename(tmpPath, destPath);
+          return;
+        } catch (err: unknown) {
+          const code = (err as NodeJS.ErrnoException)?.code;
+          if (code === 'EPERM' || code === 'EBUSY' || code === 'EACCES') {
+            lastErr = err;
+            await new Promise((r) => setTimeout(r, 25 * (attempt + 1)));
+            continue;
+          }
+          throw err;
+        }
+      }
+      throw lastErr;
+    } catch (err) {
+      await fs.rm(tmpPath, { force: true }).catch(() => {});
+      throw err;
+    }
+  }
+
   /**
    * Stage-2 local deterministic mixdown.
+   * Always stores the canonical export under DATA_DIR/projects/<id>/exports/,
+   * and optionally delivers a ready-to-play copy to `outputPath` (file or directory).
    */
   async mixProject(
     projectId: string,
-    options: { format?: ExportFormat; maxCuesPerBatch?: number } = {},
-  ): Promise<{ project: Project; exportRecord: MixExport; telemetry: MixdownTelemetry }> {
+    options: {
+      format?: ExportFormat;
+      maxCuesPerBatch?: number;
+      outputPath?: string;
+      fromCueId?: string;
+      toCueId?: string;
+      startSec?: number;
+      endSec?: number;
+    } = {},
+  ): Promise<{
+    project: Project;
+    exportRecord: MixExport;
+    telemetry: MixdownTelemetry;
+    deliveredPath: string | null;
+  }> {
     const projectSnapshot = await this.store.requireProject(projectId);
+
+    // Validate delivery destination BEFORE running FFmpeg so invalid/disallowed paths fail fast
+    let delivery: { format: ExportFormat; targetPath: string; isDirectory: boolean } | null = null;
+    if (options.outputPath !== undefined) {
+      delivery = await this.resolveDeliveryDestination(options.outputPath, options.format);
+    }
+    const format: ExportFormat = delivery?.format ?? options.format ?? 'ogg';
+
     const { exportRecord, telemetry } = await runMixdown(projectSnapshot, this.store, {
-      format: options.format ?? 'ogg',
+      format,
       ffmpegPath: this.ffmpegPath,
       ffprobePath: this.ffprobePath,
       allowCustomFfmpegFilter: this.allowCustomFfmpegFilter,
       maxCuesPerBatch: options.maxCuesPerBatch,
+      fromCueId: options.fromCueId,
+      toCueId: options.toCueId,
+      startSec: options.startSec,
+      endSec: options.endSec,
     });
+
+    let deliveredPath: string | null = null;
+    if (delivery) {
+      const finalDest = delivery.isDirectory
+        ? path.join(delivery.targetPath, `${projectId}_${exportRecord.id}.${exportRecord.format}`)
+        : delivery.targetPath;
+      const canonicalAbs = this.store.resolveProjectFile(projectId, exportRecord.audioPath);
+      await this.atomicCopyFile(canonicalAbs, finalDest);
+      deliveredPath = finalDest;
+    }
 
     const project = await this.store.updateProject(projectId, (current) => {
       current.exports.push(exportRecord);
       return current;
     });
 
-    return { project, exportRecord, telemetry };
+    return { project, exportRecord, telemetry, deliveredPath };
   }
 
-  // --- Shared Asset Library (beds & SFX under DATA_DIR/assets/) ---
+  // --- Shared Asset Library (beds & SFX under DATA_DIR/assets/ + external read-only mounts) ---
 
   async listAssets(): Promise<AssetFileEntry[]> {
     return this.store.listAssets();
+  }
+
+  async listAssetMountsSummary(): Promise<AssetMountSummary[]> {
+    const indexedCounts = await this.assetIndex.getMountIndexCounts();
+    return this.store.getAssetMounts().map((m) => ({
+      alias: m.alias,
+      readOnly: m.readOnly,
+      indexedCount: indexedCounts.has(m.alias) ? indexedCounts.get(m.alias)! : null,
+    }));
+  }
+
+  async startIndexAssets(
+    options: Omit<IndexAssetsOptions, 'onProgress'> = {},
+  ): Promise<{
+    job: StudioJob;
+    done: Promise<{ job: StudioJob; summary: IndexAssetsSummary }>;
+  }> {
+    const initialJob = this.jobs.create('_assets', 'index_assets', 0);
+    const runningJob = this.jobs.update(initialJob.id, { status: 'running' });
+
+    const done = (async () => {
+      try {
+        const summary = await this.assetIndex.indexAssets({
+          ...options,
+          onProgress: ({ completed, total }) => {
+            this.jobs.update(initialJob.id, { completed, total });
+          },
+        });
+        const finalJob = this.jobs.update(initialJob.id, {
+          status: 'completed',
+          total: summary.scannedFiles,
+          completed: summary.scannedFiles,
+          result: summary,
+        });
+        return { job: finalJob, summary };
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        this.jobs.recordError(initialJob.id, '_assets', message);
+        this.jobs.update(initialJob.id, { status: 'failed' });
+        throw err;
+      }
+    })();
+
+    return { job: runningJob, done };
+  }
+
+  async indexAssets(
+    options: Omit<IndexAssetsOptions, 'onProgress'> = {},
+  ): Promise<{ job: StudioJob; summary: IndexAssetsSummary }> {
+    const { done } = await this.startIndexAssets(options);
+    return done;
+  }
+
+  async searchAssets(options: AssetSearchOptions): Promise<AssetSearchResult> {
+    return this.assetIndex.searchAssets(options);
+  }
+
+  /**
+   * Auditions a local or `@alias/...` asset file (or a `[startSec, startSec + maxDurationSec]` slice).
+   * Streams directly when untouched and <= 4 MB; otherwise fast-seeks (`-ss` before `-i`),
+   * transcodes to compact OGG Opus 96k, and caches the slice under `DATA_DIR/asset_previews/`
+   * so inline MCP audio stays well under the 10 MB cap and `previewAudioPath` is always readable on disk.
+   */
+  async getAssetAudio(options: GetAssetAudioOptions): Promise<AssetAudioPreviewResult> {
+    const resolved = await this.store.resolveExistingAssetFile(options.assetPath);
+    const probe = await probeAudio(resolved.absPath, this.ffprobePath);
+    const st = await fs.stat(resolved.absPath);
+
+    const totalDurationSec = Number((probe.durationMs / 1000).toFixed(3));
+    const startSec = Math.max(0, options.startSec ?? 0);
+    const maxDurationSec = Math.max(0.1, Math.min(30, options.maxDurationSec ?? 15));
+
+    if (totalDurationSec > 0 && startSec >= totalDurationSec) {
+      throw new StoreError(
+        `startSec (${startSec}s) exceeds asset duration (${totalDurationSec}s) for "${resolved.canonicalPath}"`,
+        400,
+      );
+    }
+
+    const previewDurationSec = Number(
+      Math.max(0, Math.min(maxDurationSec, Math.max(0, totalDurationSec - startSec))).toFixed(3),
+    );
+
+    const DIRECT_STREAM_LIMIT_BYTES = 4 * 1024 * 1024;
+    const canStreamDirect =
+      startSec === 0 &&
+      totalDurationSec <= maxDurationSec + 0.05 &&
+      st.size <= DIRECT_STREAM_LIMIT_BYTES;
+
+    if (canStreamDirect) {
+      const audioBuffer = await fs.readFile(resolved.absPath);
+      const ext = path.extname(resolved.absPath).toLowerCase();
+      const mimeByExt: Record<string, string> = {
+        '.wav': 'audio/wav',
+        '.ogg': 'audio/ogg',
+        '.mp3': 'audio/mpeg',
+        '.flac': 'audio/flac',
+        '.m4a': 'audio/mp4',
+      };
+      return {
+        assetPath: resolved.canonicalPath,
+        filePath: resolved.absPath,
+        previewAudioPath: resolved.absPath,
+        mount: resolved.mount,
+        readOnly: resolved.readOnly,
+        totalDurationSec,
+        previewStartSec: 0,
+        previewDurationSec: totalDurationSec,
+        channels: probe.channels,
+        sampleRate: probe.sampleRate,
+        sizeBytes: audioBuffer.length,
+        mimeType: mimeByExt[ext] ?? 'application/octet-stream',
+        transcoded: false,
+        audioBuffer,
+      };
+    }
+
+    const outChannels = Math.min(2, Math.max(1, probe.channels || 1));
+    const targetDurationSec = Math.max(0.1, previewDurationSec || maxDurationSec);
+    const cacheHash = crypto
+      .createHash('sha1')
+      .update(
+        JSON.stringify({
+          canonicalPath: resolved.canonicalPath,
+          size: st.size,
+          mtimeMs: Math.round(st.mtimeMs),
+          startSec: startSec.toFixed(3),
+          targetDurationSec: targetDurationSec.toFixed(3),
+          outChannels,
+          codec: 'opus_96k_48000',
+        }),
+      )
+      .digest('hex')
+      .slice(0, 16);
+    const fileId = `aprev_${cacheHash}`;
+    const cachedPath = this.store.resolveAssetPreviewPath(fileId, '.ogg');
+
+    try {
+      const cachedStat = await fs.stat(cachedPath);
+      if (cachedStat.isFile() && cachedStat.size > 0) {
+        const audioBuffer = await fs.readFile(cachedPath);
+        const previewProbe = await probeAudio(cachedPath, this.ffprobePath).catch(() => null);
+        return {
+          assetPath: resolved.canonicalPath,
+          filePath: resolved.absPath,
+          previewAudioPath: cachedPath,
+          mount: resolved.mount,
+          readOnly: resolved.readOnly,
+          totalDurationSec,
+          previewStartSec: Number(startSec.toFixed(3)),
+          previewDurationSec: previewProbe
+            ? Number((previewProbe.durationMs / 1000).toFixed(3))
+            : previewDurationSec,
+          channels: outChannels,
+          sampleRate: 48000,
+          sizeBytes: audioBuffer.length,
+          mimeType: 'audio/ogg',
+          transcoded: true,
+          audioBuffer,
+        };
+      }
+    } catch {
+      // Cache miss: generate sliced preview below
+    }
+
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'thebooth-audition-'));
+    try {
+      const outPath = path.join(tempDir, 'preview.ogg');
+      const args = ['-hide_banner', '-y'];
+      if (startSec > 0) {
+        args.push('-ss', startSec.toFixed(3));
+      }
+      args.push(
+        '-i',
+        resolved.absPath,
+        '-t',
+        targetDurationSec.toFixed(3),
+        '-c:a',
+        'libopus',
+        '-b:a',
+        '96k',
+        '-vbr',
+        'on',
+        '-ar',
+        '48000',
+        '-ac',
+        String(outChannels),
+        outPath,
+      );
+      await runCommand(this.ffmpegPath, args);
+      const audioBuffer = await fs.readFile(outPath);
+      const previewAudioPath = await this.store.writeAssetPreview(fileId, audioBuffer, '.ogg');
+      const previewProbe = await probeAudio(previewAudioPath, this.ffprobePath).catch(() => null);
+      return {
+        assetPath: resolved.canonicalPath,
+        filePath: resolved.absPath,
+        previewAudioPath,
+        mount: resolved.mount,
+        readOnly: resolved.readOnly,
+        totalDurationSec,
+        previewStartSec: Number(startSec.toFixed(3)),
+        previewDurationSec: previewProbe
+          ? Number((previewProbe.durationMs / 1000).toFixed(3))
+          : previewDurationSec,
+        channels: outChannels,
+        sampleRate: 48000,
+        sizeBytes: audioBuffer.length,
+        mimeType: 'audio/ogg',
+        transcoded: true,
+        audioBuffer,
+      };
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    }
   }
 
   async uploadAsset(input: {
     assetPath: string;
     buffer: Buffer;
   }): Promise<UploadedAssetInfo> {
+    this.store.assertWritableAssetPath(input.assetPath);
     if (!input.buffer || input.buffer.length === 0) {
       throw new StoreError('Uploaded asset audio buffer is empty', 400);
     }
@@ -1229,7 +1876,11 @@ export class StudioService {
     projectId: string,
     voiceId: string,
     input: AuditionVoiceInput,
-  ): Promise<{ voice: VoiceProfile; auditions: VoiceAudition[] }> {
+  ): Promise<{
+    voice: VoiceProfile;
+    auditions: VoiceAudition[];
+    reel?: ComparisonReelSummary;
+  }> {
     if (!input.candidateVoiceIds || input.candidateVoiceIds.length === 0) {
       throw new StoreError('At least one candidateVoiceId is required', 400);
     }
@@ -1240,7 +1891,8 @@ export class StudioService {
     const provider = this.getProvider(providerName);
 
     const createdAuditions: VoiceAudition[] = [];
-    for (const candidateVoiceId of input.candidateVoiceIds) {
+    for (let i = 0; i < input.candidateVoiceIds.length; i++) {
+      const candidateVoiceId = input.candidateVoiceIds[i]!;
       const synth = await provider.synthesize({
         text: input.sampleText,
         voiceId: candidateVoiceId,
@@ -1256,6 +1908,7 @@ export class StudioService {
       );
       createdAuditions.push({
         id: auditionId,
+        label: indexToReelLabel(i),
         providerVoiceId: candidateVoiceId,
         sampleText: input.sampleText,
         audioPath,
@@ -1276,10 +1929,283 @@ export class StudioService {
       return current;
     });
 
+    const shouldRenderReel =
+      input.renderReel === true ||
+      (input.renderReel !== false && createdAuditions.length >= 2);
+    let reel: ComparisonReelSummary | undefined;
+    if (shouldRenderReel) {
+      reel = await this.renderAuditionReel(projectId, voiceId, {
+        auditionIds: createdAuditions.map((a) => a.id),
+        format: input.reelFormat,
+        outputPath: input.reelOutputPath,
+      });
+    }
+
     return {
       voice: updated.voices[voiceId]!,
       auditions: createdAuditions,
+      ...(reel ? { reel } : {}),
     };
+  }
+
+  /**
+   * Renders a single loudness-matched, labeled A/B casting reel ("A", "B", ...)
+   * from a role's audition clips, with optional direct delivery to `outputPath`.
+   */
+  async renderAuditionReel(
+    projectId: string,
+    voiceId: string,
+    options: {
+      auditionIds?: string[];
+      format?: ExportFormat;
+      outputPath?: string;
+    } = {},
+  ): Promise<ComparisonReelSummary> {
+    const project = await this.store.requireProject(projectId);
+    const voice = project.voices[voiceId];
+    if (!voice) {
+      throw new StoreError(`Voice not found: ${voiceId}`, 404);
+    }
+    const allAuditions = voice.auditions ?? [];
+    if (allAuditions.length === 0) {
+      throw new StoreError(`Voice "${voiceId}" has no auditions yet`, 400);
+    }
+
+    let selected: VoiceAudition[];
+    if (options.auditionIds && options.auditionIds.length > 0) {
+      selected = options.auditionIds.map((id) => {
+        const found = allAuditions.find((a) => a.id === id);
+        if (!found) {
+          throw new StoreError(`Audition "${id}" not found on voice "${voiceId}"`, 404);
+        }
+        return found;
+      });
+    } else {
+      selected = allAuditions;
+    }
+
+    let delivery: { format: ExportFormat; targetPath: string; isDirectory: boolean } | null = null;
+    if (options.outputPath !== undefined) {
+      delivery = await this.resolveDeliveryDestination(options.outputPath, options.format);
+    }
+    const format: ExportFormat = delivery?.format ?? options.format ?? 'ogg';
+
+    const reelId = `audreel_${voiceId}_${crypto.randomBytes(4).toString('hex')}`;
+    const reelPath = path.join(this.store.reelsDir(projectId), `${reelId}.${format}`);
+
+    const rendered = await renderComparisonReel({
+      entries: selected.map((a, idx) => ({
+        label: a.label ?? indexToReelLabel(idx),
+        id: a.id,
+        audioPath: this.store.resolveProjectFile(projectId, a.audioPath),
+        meta: {
+          auditionId: a.id,
+          providerVoiceId: a.providerVoiceId,
+          sampleText: a.sampleText,
+        },
+      })),
+      outputPath: reelPath,
+      format,
+      targetLufs: project.audio.workingTakeLufs,
+      sampleRate: project.audio.sampleRate,
+      ffmpegPath: this.ffmpegPath,
+      ffprobePath: this.ffprobePath,
+    });
+
+    let deliveredPath: string | null = null;
+    if (delivery) {
+      const finalDest = delivery.isDirectory
+        ? path.join(delivery.targetPath, `${projectId}_${reelId}.${format}`)
+        : delivery.targetPath;
+      await this.atomicCopyFile(reelPath, finalDest);
+      deliveredPath = finalDest;
+    }
+
+    return {
+      reelPath,
+      deliveredPath,
+      format: rendered.format,
+      durationSec: rendered.durationSec,
+      entries: rendered.entries,
+    };
+  }
+
+  /**
+   * "Play both takes in context": renders a loudness-matched labeled A/B stereo comparison reel
+   * playing surrounding context cues (e.g. Dracula's lead-in) + Take A, followed by a gentle
+   * studio separator and the same exchange with Take B.
+   */
+  async renderTakeComparisonReel(
+    projectId: string,
+    cueId: string,
+    options: {
+      takeIds?: string[];
+      contextBeforeCues?: number;
+      contextAfterCues?: number;
+      format?: ExportFormat;
+      outputPath?: string;
+    } = {},
+  ): Promise<ComparisonReelSummary & { cueId: string; contextCueIds: string[] }> {
+    const project = await this.store.requireProject(projectId);
+    const cueIdx = project.cues.findIndex((c) => c.id === cueId);
+    if (cueIdx === -1) {
+      throw new StoreError(`Cue not found: ${cueId}`, 404);
+    }
+    const targetCue = project.cues[cueIdx]!;
+    if (targetCue.takes.length === 0) {
+      throw new StoreError(`Cue "${cueId}" has no rendered takes to compare`, 400);
+    }
+
+    let chosenTakes: Take[];
+    if (options.takeIds && options.takeIds.length > 0) {
+      chosenTakes = options.takeIds.map((tid) => {
+        const found = targetCue.takes.find((t) => t.id === tid);
+        if (!found) {
+          throw new StoreError(`Take "${tid}" not found on cue "${cueId}"`, 404);
+        }
+        return found;
+      });
+    } else {
+      // Default: compare the two most recent takes (or single take if only one exists)
+      chosenTakes = targetCue.takes.slice(-2);
+    }
+
+    let delivery: { format: ExportFormat; targetPath: string; isDirectory: boolean } | null = null;
+    if (options.outputPath !== undefined) {
+      delivery = await this.resolveDeliveryDestination(options.outputPath, options.format);
+    }
+    const format: ExportFormat = delivery?.format ?? options.format ?? 'ogg';
+
+    const beforeCount = Math.max(0, Math.min(3, Math.floor(options.contextBeforeCues ?? 1)));
+    const afterCount = Math.max(0, Math.min(2, Math.floor(options.contextAfterCues ?? 0)));
+    const sliceStart = Math.max(0, cueIdx - beforeCount);
+    const sliceEnd = Math.min(project.cues.length - 1, cueIdx + afterCount);
+    const windowCues = project.cues.slice(sliceStart, sliceEnd + 1);
+    const windowCueIds = new Set(windowCues.map((c) => c.id));
+
+    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'thebooth-ab-'));
+    try {
+      const tempStore = new ProjectStore(tempRoot);
+      await tempStore.ensureDataDirs();
+      const tempProjDir = tempStore.projectDir(projectId);
+      await fs.mkdir(path.join(tempProjDir, 'takes'), { recursive: true });
+      await fs.mkdir(path.join(tempProjDir, 'exports'), { recursive: true });
+
+      // Copy only the raw take WAVs referenced by cues in the context window into tempStore
+      const copiedTakePaths = new Set<string>();
+      for (const c of windowCues) {
+        const takesToCopy = c.id === cueId ? chosenTakes : getActiveTake(c) ? [getActiveTake(c)!] : [];
+        for (const t of takesToCopy) {
+          if (copiedTakePaths.has(t.audioPath)) continue;
+          const src = this.store.resolveProjectFile(projectId, t.audioPath);
+          const dst = tempStore.resolveProjectFile(projectId, t.audioPath);
+          await fs.mkdir(path.dirname(dst), { recursive: true });
+          await fs.copyFile(src, dst);
+          copiedTakePaths.add(t.audioPath);
+        }
+      }
+
+      const variantEntries: Array<{
+        label: string;
+        id: string;
+        audioPath: string;
+        meta: Record<string, unknown>;
+      }> = [];
+
+      for (let i = 0; i < chosenTakes.length; i++) {
+        const take = chosenTakes[i]!;
+        const label = indexToReelLabel(i);
+
+        // Clone context window cues; anchor first cue cleanly to t=0 and swap activeTakeId on targetCue
+        const clonedCues: Cue[] = windowCues.map((c, wi) => {
+          const clonedTiming = { ...c.timing };
+          if (wi === 0) {
+            clonedTiming.afterCueId = null;
+            clonedTiming.offsetMs = 0;
+          } else if (
+            clonedTiming.afterCueId &&
+            !windowCueIds.has(clonedTiming.afterCueId)
+          ) {
+            clonedTiming.afterCueId = undefined;
+          }
+          return {
+            ...c,
+            timing: clonedTiming,
+            mix: { ...c.mix },
+            activeTakeId: c.id === cueId ? take.id : c.activeTakeId,
+            takes: c.takes.map((t) => ({ ...t })),
+          };
+        });
+
+        const variantProject: Project = {
+          ...project,
+          audio: {
+            ...project.audio,
+            // Shorter quiet tail inside individual A/B clips so transitions feel tight
+            tailMs: 350,
+          },
+          cues: clonedCues,
+          // Keep synthetic room tone beds cleanly; skip external asset beds if absent in tempStore
+          beds: project.beds.filter((b) => b.kind === 'synthetic_room_tone'),
+          sfx: [],
+          exports: [],
+        };
+
+        const { exportRecord } = await runMixdown(variantProject, tempStore, {
+          format: 'wav',
+          ffmpegPath: this.ffmpegPath,
+          ffprobePath: this.ffprobePath,
+          allowCustomFfmpegFilter: this.allowCustomFfmpegFilter,
+        });
+
+        variantEntries.push({
+          label,
+          id: take.id,
+          audioPath: tempStore.resolveProjectFile(projectId, exportRecord.audioPath),
+          meta: {
+            takeId: take.id,
+            cueId,
+            direction: take.direction,
+            measuredLufs: take.measuredLufs,
+            notes: take.notes ?? null,
+          },
+        });
+      }
+
+      const reelId = `ab_${cueId}_${crypto.randomBytes(4).toString('hex')}`;
+      const reelPath = path.join(this.store.reelsDir(projectId), `${reelId}.${format}`);
+
+      const rendered = await renderComparisonReel({
+        entries: variantEntries,
+        outputPath: reelPath,
+        format,
+        targetLufs: project.audio.workingTakeLufs,
+        sampleRate: project.audio.sampleRate,
+        ffmpegPath: this.ffmpegPath,
+        ffprobePath: this.ffprobePath,
+      });
+
+      let deliveredPath: string | null = null;
+      if (delivery) {
+        const finalDest = delivery.isDirectory
+          ? path.join(delivery.targetPath, `${projectId}_${reelId}.${format}`)
+          : delivery.targetPath;
+        await this.atomicCopyFile(reelPath, finalDest);
+        deliveredPath = finalDest;
+      }
+
+      return {
+        cueId,
+        contextCueIds: windowCues.map((c) => c.id),
+        reelPath,
+        deliveredPath,
+        format: rendered.format,
+        durationSec: rendered.durationSec,
+        entries: rendered.entries,
+      };
+    } finally {
+      await fs.rm(tempRoot, { recursive: true, force: true }).catch(() => {});
+    }
   }
 
   async getAuditionAudioFile(
@@ -1306,17 +2232,28 @@ export class StudioService {
   async selectAudition(
     projectId: string,
     voiceId: string,
-    auditionId: string,
+    auditionIdOrLabel: string,
   ): Promise<VoiceProfile> {
     const updated = await this.store.updateProject(projectId, (current) => {
       const voice = current.voices[voiceId];
       if (!voice) {
         throw new StoreError(`Voice not found: ${voiceId}`, 404);
       }
-      const audition = (voice.auditions ?? []).find((a) => a.id === auditionId);
+      const auditions = voice.auditions ?? [];
+      // Support direct audition ID OR friendly A/B label (resolving latest matching label)
+      let audition = auditions.find((a) => a.id === auditionIdOrLabel);
+      if (!audition) {
+        const normLabel = auditionIdOrLabel.trim().toUpperCase();
+        for (let i = auditions.length - 1; i >= 0; i--) {
+          if ((auditions[i]!.label ?? '').toUpperCase() === normLabel) {
+            audition = auditions[i];
+            break;
+          }
+        }
+      }
       if (!audition) {
         throw new StoreError(
-          `Audition "${auditionId}" not found on voice "${voiceId}"`,
+          `Audition "${auditionIdOrLabel}" not found on voice "${voiceId}"`,
           404,
         );
       }
@@ -1416,13 +2353,18 @@ export class StudioService {
         bestTakeId = take.id;
       }
 
-      // Persist Director review notes onto the reviewed take
-      const notePrefix = `[Director:${resolvedPersona.presetId ?? 'custom'} score=${verdict.score}/10 ${verdict.approved ? 'APPROVED' : 'RETAKE'}]`;
+      // Persist Director review notes (with timestamped listening moments) onto the reviewed take
+      const momentSummary = (verdict.moments ?? [])
+        .map((m) => `@${m.timestampSec.toFixed(1)}s${m.phrase ? ` ("${m.phrase}")` : ''}: ${m.note}`)
+        .join('; ');
+      const notePrefix = `[Director:${resolvedPersona.presetId ?? 'custom'} ${verdict.approved ? 'APPROVED' : 'RETAKE'}]`;
       await this.store.updateProject(projectId, (current) => {
         const targetCue = current.cues.find((c) => c.id === cueId);
         const targetTake = targetCue?.takes.find((t) => t.id === take.id);
         if (targetTake) {
-          targetTake.notes = `${notePrefix} ${verdict.feedback}`;
+          targetTake.notes = momentSummary
+            ? `${notePrefix} ${verdict.feedback} | ${momentSummary}`
+            : `${notePrefix} ${verdict.feedback}`;
         }
         if (verdict.approved && targetCue && allowMixAdjustments && verdict.suggestedMixPatch) {
           if (verdict.suggestedMixPatch.gainDb !== undefined) {
@@ -1470,13 +2412,53 @@ export class StudioService {
       await this.updateCue(projectId, cueId, { activeTakeId: bestTakeId });
     }
 
+    const selectedAttempt =
+      attempts.find((a) => a.takeId === bestTakeId) ?? attempts[attempts.length - 1];
+    const firstAttempt = attempts[0];
+    const observation = selectedAttempt?.verdict.feedback ?? 'No review attempts recorded.';
+    const changes: string[] = [];
+    if (retakesUsed > 0) {
+      const dirs = attempts
+        .map((a) => a.verdict.suggestedDirection?.trim())
+        .filter((d): d is string => Boolean(d));
+      changes.push(
+        dirs.length > 0
+          ? `${retakesUsed} retake${retakesUsed === 1 ? '' : 's'} with adjusted direction (${dirs[dirs.length - 1]})`
+          : `${retakesUsed} retake${retakesUsed === 1 ? '' : 's'} recorded`,
+      );
+      if (firstAttempt && firstAttempt.takeId !== bestTakeId) {
+        changes.push(`switched active take from ${firstAttempt.takeId} to ${bestTakeId}`);
+      } else if (!approved && firstAttempt) {
+        changes.push(`kept strongest take ${bestTakeId} after retake budget`);
+      }
+    } else {
+      changes.push(`kept initial take ${bestTakeId}`);
+    }
+    if (approved && allowMixAdjustments && selectedAttempt?.verdict.suggestedMixPatch) {
+      const mp = selectedAttempt.verdict.suggestedMixPatch;
+      const parts: string[] = [];
+      if (mp.gainDb !== undefined) parts.push(`gainDb=${mp.gainDb}`);
+      if (mp.eqPreset !== undefined) parts.push(`eqPreset=${mp.eqPreset}`);
+      if (parts.length > 0) changes.push(`applied mix patch (${parts.join(', ')})`);
+    }
+    const changeSummary = changes.join('; ');
+
+    // Surface timestamped listening moments from the selected attempt (or initial rejection if selected has none)
+    const moments =
+      (selectedAttempt?.verdict.moments && selectedAttempt.verdict.moments.length > 0
+        ? selectedAttempt.verdict.moments
+        : firstAttempt?.verdict.moments) ?? [];
+
     return {
       cueId,
       approved,
       selectedTakeId: bestTakeId,
-      bestScore,
+      observation,
+      changeSummary,
+      moments,
       retakesUsed,
       personaUsed: resolvedPersona.presetId ?? resolvedPersona.label,
+      bestScore,
       attempts,
     };
   }

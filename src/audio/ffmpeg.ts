@@ -63,6 +63,10 @@ export interface AudioProbeInfo {
   codecName: string;
 }
 
+export interface AudioProbeWithTagsInfo extends AudioProbeInfo {
+  tags: Record<string, string>;
+}
+
 export async function probeAudio(
   filePath: string,
   ffprobePath = 'ffprobe',
@@ -106,6 +110,66 @@ export async function probeAudio(
     sampleRate,
     channels,
     codecName: stream.codec_name ?? 'unknown',
+  };
+}
+
+/**
+ * Probes audio stream properties plus embedded container tags (BWF bext, RIFF INFO, ID3, Vorbis).
+ */
+export async function probeAudioWithTags(
+  filePath: string,
+  ffprobePath = 'ffprobe',
+): Promise<AudioProbeWithTagsInfo> {
+  const { stdout } = await runCommand(ffprobePath, [
+    '-v',
+    'error',
+    '-select_streams',
+    'a:0',
+    '-show_entries',
+    'stream=codec_name,sample_rate,channels,duration:format=duration:format_tags',
+    '-of',
+    'json',
+    filePath,
+  ]);
+
+  const parsed = JSON.parse(stdout) as {
+    streams?: Array<{
+      codec_name?: string;
+      sample_rate?: string;
+      channels?: number;
+      duration?: string;
+    }>;
+    format?: {
+      duration?: string;
+      tags?: Record<string, unknown>;
+    };
+  };
+
+  const stream = parsed.streams?.[0];
+  if (!stream) {
+    throw new Error(`No audio stream found in ${filePath}`);
+  }
+
+  const rawDuration = stream.duration ?? parsed.format?.duration;
+  const durationSec = rawDuration ? Number(rawDuration) : 0;
+  const sampleRate = stream.sample_rate ? Number(stream.sample_rate) : 0;
+  const channels = stream.channels ?? 0;
+
+  const tags: Record<string, string> = {};
+  if (parsed.format?.tags && typeof parsed.format.tags === 'object') {
+    for (const [k, v] of Object.entries(parsed.format.tags)) {
+      if (typeof v === 'string' && v.trim()) {
+        tags[k] = v.trim();
+      }
+    }
+  }
+
+  return {
+    durationMs: Number.isFinite(durationSec) ? Math.round(durationSec * 1000) : 0,
+    sampleRate,
+    channels,
+    codecName: stream.codec_name ?? 'unknown',
+    tags,
   };
 }
 
@@ -200,5 +264,39 @@ export async function measureAudioLoudness(
     peakDbfs,
     truePeakDbtp,
     channelRmsDbfs,
+  };
+}
+
+export interface AssetLevelMeasurement {
+  rmsDbfs: number;
+  peakDbfs: number;
+}
+
+/**
+ * Fast single-pass loudness level measurement (RMS + sample peak in dBFS) via FFmpeg `astats`.
+ * Caps analysis at `maxDurationSec` (default 60s) so long field recordings index rapidly.
+ */
+export async function measureAssetLevels(
+  filePath: string,
+  ffmpegPath = 'ffmpeg',
+  maxDurationSec = 60,
+): Promise<AssetLevelMeasurement> {
+  const args = ['-hide_banner', '-nostats'];
+  if (maxDurationSec > 0) {
+    args.push('-t', String(maxDurationSec));
+  }
+  args.push('-i', filePath, '-af', 'astats=metadata=0:reset=0', '-f', 'null', '-');
+  const { stderr } = await runCommand(ffmpegPath, args);
+
+  const overallMatch = stderr.match(/Overall[\s\S]*$/);
+  const overallText = overallMatch ? overallMatch[0] : stderr;
+  const overallRmsMatch = overallText.match(/RMS level dB:\s*([+-]?\d+(?:\.\d+)?|-inf)/i);
+  const overallPeakMatch = overallText.match(/Peak level dB:\s*([+-]?\d+(?:\.\d+)?|-inf)/i);
+
+  const rawRms = parseDbNumber(overallRmsMatch?.[1]);
+  const rawPeak = parseDbNumber(overallPeakMatch?.[1]);
+  return {
+    rmsDbfs: rawRms !== null ? Number(rawRms.toFixed(1)) : -96,
+    peakDbfs: rawPeak !== null ? Number(rawPeak.toFixed(1)) : -96,
   };
 }

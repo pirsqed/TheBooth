@@ -29,11 +29,21 @@ export class MockDirectorReviewer implements DirectorReviewer {
       return this.decide(req);
     }
 
+    const snippet = req.cue.text.trim().split(/\s+/).slice(0, 3).join(' ');
+    const midSec = Number(Math.max(0.1, (req.take.durationMs / 1000) * 0.35).toFixed(2));
+
     if (req.attempt >= this.approveOnAttempt) {
       return {
         approved: true,
         score: 8.5,
         feedback: `Take ${req.attempt + 1} nailed the pacing and warmth (${req.persona ?? 'default'} persona).`,
+        moments: [
+          {
+            timestampSec: midSec,
+            phrase: snippet || null,
+            note: 'Natural breath settle and clear emotional presence.',
+          },
+        ],
         suggestedDirection: null,
         suggestedText: null,
         suggestedMixPatch: null,
@@ -44,6 +54,13 @@ export class MockDirectorReviewer implements DirectorReviewer {
       approved: false,
       score: 5.5 + req.attempt * 0.5,
       feedback: `Take ${req.attempt + 1} felt slightly brisk; soften and slow down on retake.`,
+      moments: [
+        {
+          timestampSec: midSec,
+          phrase: snippet || null,
+          note: 'Measured delivery pushes too fast across the beat; leave more air.',
+        },
+      ],
       suggestedDirection: 'slower, softer, warm close-mic whisper',
       suggestedText: null,
       suggestedMixPatch: null,

@@ -1,6 +1,7 @@
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
+import type { AssetLibraryMount } from '../config.js';
 import {
   Project,
   ProjectSchema,
@@ -26,6 +27,8 @@ export const ALLOWED_ASSET_EXTENSIONS = new Set([
   '.m4a',
 ]);
 
+export const ASSET_FALLBACK_EXTENSIONS = ['.wav', '.ogg', '.mp3', '.flac', '.m4a'] as const;
+
 export interface AssetFileEntry {
   path: string;
   sizeBytes: number;
@@ -33,7 +36,24 @@ export interface AssetFileEntry {
   modifiedAt: string;
 }
 
-async function atomicWriteFile(filePath: string, data: string | Buffer): Promise<void> {
+export interface AssetMountInfo {
+  alias: string;
+  rootDir: string;
+  readOnly: boolean;
+}
+
+export interface ResolvedAssetFile {
+  absPath: string;
+  mount: string;
+  readOnly: boolean;
+  canonicalPath: string;
+}
+
+export interface ProjectStoreOptions {
+  assetLibraryMounts?: AssetLibraryMount[];
+}
+
+export async function atomicWriteFile(filePath: string, data: string | Buffer): Promise<void> {
   const dir = path.dirname(filePath);
   await fs.mkdir(dir, { recursive: true });
   const tmpName = `${path.basename(filePath)}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
@@ -82,8 +102,20 @@ function assertWithinRoot(rootDir: string, targetPath: string, label: string): s
 
 export class ProjectStore {
   private readonly locks = new Map<string, Promise<void>>();
+  private readonly externalMounts: AssetLibraryMount[];
+  private readonly externalMountMap: Map<string, AssetLibraryMount>;
 
-  constructor(private readonly dataDir: string) {}
+  constructor(
+    private readonly dataDir: string,
+    options: ProjectStoreOptions = {},
+  ) {
+    this.externalMounts = (options.assetLibraryMounts ?? []).map((m) => ({
+      alias: m.alias,
+      rootDir: path.resolve(m.rootDir),
+      readOnly: true,
+    }));
+    this.externalMountMap = new Map(this.externalMounts.map((m) => [m.alias, m]));
+  }
 
   get rootDir(): string {
     return path.resolve(this.dataDir);
@@ -93,12 +125,87 @@ export class ProjectStore {
     return path.join(this.rootDir, 'assets');
   }
 
+  get assetsIndexPath(): string {
+    return path.join(this.rootDir, 'assets_index.json');
+  }
+
+  get assetsEmbeddingsPath(): string {
+    return path.join(this.rootDir, 'assets_embeddings.f32');
+  }
+
+  get assetLibraryMounts(): AssetLibraryMount[] {
+    return this.externalMounts.map((m) => ({ ...m }));
+  }
+
+  getAssetMounts(): AssetMountInfo[] {
+    return [
+      { alias: 'local', rootDir: this.assetsDir, readOnly: false },
+      ...this.externalMounts.map((m) => ({
+        alias: m.alias,
+        rootDir: m.rootDir,
+        readOnly: true,
+      })),
+    ];
+  }
+
+  isExternalAssetPath(assetPath: string): boolean {
+    return assetPath.trim().startsWith('@');
+  }
+
+  assertWritableAssetPath(assetPath: string): void {
+    if (this.isExternalAssetPath(assetPath)) {
+      throw new StoreError('External asset libraries are read-only', 403);
+    }
+  }
+
+  private parseExternalAssetPath(
+    assetPath: string,
+  ): { mount: AssetLibraryMount; relPath: string } {
+    const normalized = assetPath.replace(/\\/g, '/');
+    const match = normalized.match(/^@([a-z0-9_-]+)\/(.+)$/);
+    if (!match) {
+      throw new StoreError(
+        `Invalid external asset path "${assetPath}" (expected "@<alias>/<relative-path>")`,
+        400,
+      );
+    }
+    const alias = match[1]!;
+    const relPath = match[2]!;
+    const mount = this.externalMountMap.get(alias);
+    if (!mount) {
+      throw new StoreError(`Unknown external asset library mount "@${alias}"`, 404);
+    }
+    if (!relPath || path.isAbsolute(relPath) || /^[a-zA-Z]:/.test(relPath)) {
+      throw new StoreError(`Asset path must be relative to @${alias}/: ${assetPath}`, 400);
+    }
+    return { mount, relPath };
+  }
+
   get projectsRootDir(): string {
     return path.join(this.rootDir, 'projects');
   }
 
   get voicePreviewsDir(): string {
     return path.join(this.rootDir, 'voice_previews');
+  }
+
+  get assetPreviewsDir(): string {
+    return path.join(this.rootDir, 'asset_previews');
+  }
+
+  resolveAssetPreviewPath(fileId: string, ext = '.ogg'): string {
+    assertSafeId(fileId, 'fileId');
+    const cleanExt = ext.startsWith('.') ? ext.toLowerCase() : `.${ext.toLowerCase()}`;
+    if (!/^\.[a-z0-9]{1,8}$/.test(cleanExt)) {
+      throw new StoreError(`Invalid preview file extension: ${ext}`, 400);
+    }
+    return assertWithinRoot(this.assetPreviewsDir, `${fileId}${cleanExt}`, 'asset preview');
+  }
+
+  async writeAssetPreview(fileId: string, data: Buffer, ext = '.ogg'): Promise<string> {
+    const absPath = this.resolveAssetPreviewPath(fileId, ext);
+    await atomicWriteFile(absPath, data);
+    return absPath;
   }
 
   resolveVoicePreviewPath(voiceId: string): string {
@@ -139,15 +246,100 @@ export class ProjectStore {
     return path.join(this.projectDir(projectId), 'visuals');
   }
 
+  reelsDir(projectId: string): string {
+    return path.join(this.projectDir(projectId), 'reels');
+  }
+
   resolveProjectFile(projectId: string, relativePath: string): string {
     return assertWithinRoot(this.projectDir(projectId), relativePath, 'project file');
   }
 
   resolveAssetPath(assetPath: string): string {
-    if (!assetPath || path.isAbsolute(assetPath)) {
+    if (!assetPath || assetPath.includes('\0')) {
+      throw new StoreError(`Invalid asset path: ${assetPath}`, 400);
+    }
+    if (this.isExternalAssetPath(assetPath)) {
+      const { mount, relPath } = this.parseExternalAssetPath(assetPath);
+      return assertWithinRoot(mount.rootDir, relPath, `external asset @${mount.alias}`);
+    }
+    if (path.isAbsolute(assetPath)) {
       throw new StoreError(`Asset path must be relative to assets/: ${assetPath}`, 400);
     }
     return assertWithinRoot(this.assetsDir, assetPath, 'asset');
+  }
+
+  /**
+   * Resolves an existing local or `@<alias>/...` asset file on disk, including extensionless
+   * fallback across all supported audio extensions and realpath containment verification.
+   */
+  async resolveExistingAssetFile(assetPath: string): Promise<ResolvedAssetFile> {
+    if (!assetPath || assetPath.includes('\0')) {
+      throw new StoreError(`Invalid asset path: ${assetPath}`, 400);
+    }
+
+    const isExternal = this.isExternalAssetPath(assetPath);
+    let rootDir: string;
+    let mountAlias: string;
+
+    if (isExternal) {
+      const parsed = this.parseExternalAssetPath(assetPath);
+      rootDir = parsed.mount.rootDir;
+      mountAlias = parsed.mount.alias;
+    } else {
+      rootDir = this.assetsDir;
+      mountAlias = 'local';
+    }
+
+    const verifyAndBuild = async (candidateRel: string): Promise<ResolvedAssetFile | null> => {
+      const absPath = this.resolveAssetPath(candidateRel);
+      try {
+        const st = await fs.stat(absPath);
+        if (!st.isFile()) return null;
+      } catch {
+        return null;
+      }
+
+      // Guard against symlinks escaping the asset root
+      try {
+        const [realRoot, realTarget] = await Promise.all([
+          fs.realpath(rootDir),
+          fs.realpath(absPath),
+        ]);
+        const relReal = path.relative(realRoot, realTarget);
+        if (relReal.startsWith('..') || path.isAbsolute(relReal)) {
+          throw new StoreError(`Asset symlink escapes sandbox (${mountAlias}): ${assetPath}`, 403);
+        }
+      } catch (err: unknown) {
+        if (err instanceof StoreError) throw err;
+        return null;
+      }
+
+      const relFromRoot = path.relative(rootDir, absPath).replace(/\\/g, '/');
+      const canonicalPath = isExternal ? `@${mountAlias}/${relFromRoot}` : relFromRoot;
+      return {
+        absPath,
+        mount: mountAlias,
+        readOnly: isExternal,
+        canonicalPath,
+      };
+    };
+
+    const direct = await verifyAndBuild(assetPath);
+    if (direct) return direct;
+
+    if (!path.extname(assetPath)) {
+      for (const ext of ASSET_FALLBACK_EXTENSIONS) {
+        const fallback = await verifyAndBuild(`${assetPath}${ext}`);
+        if (fallback) return fallback;
+      }
+    }
+
+    throw new StoreError(
+      isExternal
+        ? `Audio asset not found in external library @${mountAlias}: ${assetPath}`
+        : `Audio asset not found under assets/: ${assetPath}`,
+      404,
+    );
   }
 
   async ensureDataDirs(): Promise<void> {
@@ -374,6 +566,7 @@ export class ProjectStore {
   }
 
   async writeAssetFile(assetPath: string, data: Buffer): Promise<string> {
+    this.assertWritableAssetPath(assetPath);
     this.assertValidAssetExtension(assetPath);
     const absPath = this.resolveAssetPath(assetPath);
     await this.ensureDataDirs();
@@ -382,6 +575,7 @@ export class ProjectStore {
   }
 
   async deleteAssetFile(assetPath: string): Promise<void> {
+    this.assertWritableAssetPath(assetPath);
     const absPath = this.resolveAssetPath(assetPath);
     try {
       const st = await fs.stat(absPath);

@@ -36,6 +36,18 @@ const VERDICT_JSON_SCHEMA = {
     approved: { type: 'boolean' },
     score: { type: 'number' },
     feedback: { type: 'string' },
+    moments: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          timestampSec: { type: 'number' },
+          phrase: { type: ['string', 'null'] },
+          note: { type: 'string' },
+        },
+        required: ['timestampSec', 'note'],
+      },
+    },
     suggestedDirection: { type: ['string', 'null'] },
     suggestedText: { type: ['string', 'null'] },
     suggestedMixPatch: {

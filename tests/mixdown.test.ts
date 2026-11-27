@@ -441,4 +441,223 @@ Rest easy now.
     const loaded = await store.requireProject(project.id);
     expect(loaded.cues).toHaveLength(10);
   });
+
+  it('lands sliced mono .flac SFX and delayed sliced .flac beds at their exact resolved startMs (P0 regression)', async () => {
+    await store.ensureDataDirs();
+    const flacPath = path.join(store.assetsDir, 'hit_mono.flac');
+    // 5s mono FLAC: silence 0..2s, 660Hz tone burst 2.0..2.5s, silence 2.5..5.0s
+    await runCommand('ffmpeg', [
+      '-hide_banner',
+      '-y',
+      '-f',
+      'lavfi',
+      '-i',
+      'aevalsrc=if(between(t\\,2\\,2.5)\\,0.5*sin(2*PI*660*t)\\,0):s=48000:d=5:c=mono',
+      '-c:a',
+      'flac',
+      flacPath,
+    ]);
+
+    // 1) Mono FLAC SFX with clipStartMs=2000, clipDurationMs=500 anchored at 4000ms (with pan crossfeed!)
+    const sfxProj = await service.createProject({
+      id: 'flac_sfx_timing',
+      name: 'FLAC SFX Timing Regression',
+      includeDefaultRoomTone: false,
+      audio: { tailMs: 1500 },
+    });
+    await service.upsertSfx(sfxProj.id, 'late_hit', {
+      label: 'Late FLAC Hit',
+      assetPath: 'hit_mono.flac',
+      anchor: { cueId: null, edge: 'start', offsetMs: 4000 },
+      gainDb: 0,
+      pan: 0.45,
+      clipStartMs: 2000,
+      clipDurationMs: 500,
+      fadeInMs: 15,
+      fadeOutMs: 40,
+    });
+
+    const { exportRecord } = await service.mixProject(sfxProj.id, { format: 'wav' });
+    const mixWav = store.resolveProjectFile(sfxProj.id, exportRecord.audioPath);
+
+    const earlySlice = path.join(tempDataDir, 'flac_early.wav');
+    const hitSlice = path.join(tempDataDir, 'flac_hit.wav');
+    await runCommand('ffmpeg', [
+      '-hide_banner',
+      '-y',
+      '-ss',
+      '0',
+      '-t',
+      '3.5',
+      '-i',
+      mixWav,
+      '-c:a',
+      'pcm_s16le',
+      earlySlice,
+    ]);
+    await runCommand('ffmpeg', [
+      '-hide_banner',
+      '-y',
+      '-ss',
+      '4.0',
+      '-t',
+      '0.6',
+      '-i',
+      mixWav,
+      '-c:a',
+      'pcm_s16le',
+      hitSlice,
+    ]);
+
+    const earlyStats = await measureAudioLoudness(earlySlice);
+    const hitStats = await measureAudioLoudness(hitSlice);
+    expect(earlyStats.measuredRmsDbfs).toBeLessThan(-70);
+    expect(hitStats.measuredRmsDbfs).toBeGreaterThan(-25);
+
+    // 2) Delayed sliced looped FLAC bed starting at 3000ms
+    const bedProj = await service.createProject({
+      id: 'flac_bed_timing',
+      name: 'FLAC Sliced Bed Delay Regression',
+      includeDefaultRoomTone: false,
+      audio: { tailMs: 5000 },
+    });
+    await service.upsertBed(bedProj.id, 'delayed_bed', {
+      label: 'Delayed Sliced FLAC Bed',
+      kind: 'asset_file',
+      assetPath: 'hit_mono.flac',
+      gainDb: -6,
+      loop: true,
+      startMs: 3000,
+      endMs: 5000,
+      clipStartMs: 2000,
+      clipDurationMs: 500,
+      fadeInMs: 20,
+      fadeOutMs: 20,
+      ducking: { enabled: false, amountDb: 0, attackMs: 100, releaseMs: 800 },
+    });
+
+    const bedMix = await service.mixProject(bedProj.id, { format: 'wav' });
+    const bedMixWav = store.resolveProjectFile(bedProj.id, bedMix.exportRecord.audioPath);
+    const bedBefore = path.join(tempDataDir, 'bed_before.wav');
+    const bedAfter = path.join(tempDataDir, 'bed_after.wav');
+    await runCommand('ffmpeg', [
+      '-hide_banner',
+      '-y',
+      '-ss',
+      '0',
+      '-t',
+      '2.5',
+      '-i',
+      bedMixWav,
+      '-c:a',
+      'pcm_s16le',
+      bedBefore,
+    ]);
+    await runCommand('ffmpeg', [
+      '-hide_banner',
+      '-y',
+      '-ss',
+      '3.2',
+      '-t',
+      '1.2',
+      '-i',
+      bedMixWav,
+      '-c:a',
+      'pcm_s16le',
+      bedAfter,
+    ]);
+    expect((await measureAudioLoudness(bedBefore)).measuredRmsDbfs).toBeLessThan(-70);
+    expect((await measureAudioLoudness(bedAfter)).measuredRmsDbfs).toBeGreaterThan(-25);
+  });
+
+  it('supports cold-open leadInMs, cue-anchored beds, and scene-scoped partial mixdown (fromCueId/toCueId & startSec/endSec)', async () => {
+    await store.ensureDataDirs();
+    await fs.writeFile(path.join(store.assetsDir, 'early_wind.wav'), makeNoiseWav(1000, 0.25));
+    await fs.writeFile(path.join(store.assetsDir, 'late_fire.wav'), makeNoiseWav(1000, 0.35));
+
+    const project = await service.createProject({
+      id: 'scene_scoped_test',
+      name: 'Scene Scoped Mix Test',
+      includeDefaultRoomTone: false,
+      audio: { leadInMs: 1200, tailMs: 600 },
+    });
+
+    for (let i = 1; i <= 4; i++) {
+      await service.addCue(project.id, {
+        id: `c${i}`,
+        speaker: 'mara',
+        text: `Scene dialogue line number ${i} for partial mixdown.`,
+        timing: { offsetMs: i === 1 ? 0 : 400 },
+      });
+    }
+    await service.renderAll(project.id);
+
+    // Cue-anchored beds: Scene 1 (c1..c2) and Scene 2 (c3..c4)
+    await service.upsertBed(project.id, 'bed_scene1', {
+      label: 'Scene 1 Wind',
+      kind: 'asset_file',
+      assetPath: 'early_wind.wav',
+      gainDb: -18,
+      loop: true,
+      startCueId: 'c1',
+      startOffsetMs: -1200,
+      endCueId: 'c2',
+      fadeInMs: 100,
+      fadeOutMs: 100,
+      ducking: { enabled: true, amountDb: -6, attackMs: 100, releaseMs: 400 },
+    });
+    await service.upsertBed(project.id, 'bed_scene2', {
+      label: 'Scene 2 Fire',
+      kind: 'asset_file',
+      assetPath: 'late_fire.wav',
+      gainDb: -16,
+      loop: true,
+      startCueId: 'c3',
+      endCueId: 'c4',
+      endOffsetMs: 600,
+      fadeInMs: 100,
+      fadeOutMs: 100,
+      ducking: { enabled: true, amountDb: -6, attackMs: 100, releaseMs: 400 },
+    });
+
+    const { timeline: fullTl } = await service.getProject(project.id);
+    expect(fullTl.leadInMs).toBe(1200);
+    expect(fullTl.cues[0]!.startMs).toBe(1200);
+    expect(fullTl.beds.find((b) => b.bedId === 'bed_scene2')?.startMs).toBe(
+      fullTl.cues[2]!.startMs,
+    );
+
+    // Scene-scoped partial mixdown covering ONLY c3..c4
+    const partial = await service.mixProject(project.id, {
+      format: 'wav',
+      fromCueId: 'c3',
+      toCueId: 'c4',
+    });
+    expect(partial.exportRecord.window).toMatchObject({
+      fromCueId: 'c3',
+      toCueId: 'c4',
+      startMs: fullTl.cues[2]!.startMs,
+    });
+    expect(partial.telemetry.renderedCueCount).toBe(2);
+    expect(partial.telemetry.bedCount).toBe(1); // Only bed_scene2 overlaps c3..c4!
+    expect(partial.exportRecord.durationMs).toBeLessThan(fullTl.totalDurationMs - 2000);
+
+    // Time-window partial mixdown via startSec/endSec
+    const secSlice = await service.mixProject(project.id, {
+      format: 'wav',
+      startSec: 0,
+      endSec: 1.0,
+    });
+    expect(secSlice.exportRecord.window).toEqual({ startMs: 0, endMs: 1000 });
+    expect(secSlice.exportRecord.durationMs).toBeGreaterThanOrEqual(900);
+    expect(secSlice.exportRecord.durationMs).toBeLessThanOrEqual(1150);
+    // Cold-open 0..1.0s has bed_scene1 playing before dialogue begins at 1.2s
+    expect(secSlice.telemetry.renderedCueCount).toBe(0);
+    expect(secSlice.telemetry.measuredRmsDbfs).toBeGreaterThan(-45);
+
+    // Reject mixing cue bounds and sec bounds
+    await expect(
+      service.mixProject(project.id, { fromCueId: 'c1', startSec: 1 }),
+    ).rejects.toMatchObject({ statusCode: 400 });
+  });
 });

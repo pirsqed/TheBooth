@@ -41,6 +41,7 @@ npm run build && npm start
 | `masterTargetLufs` | `-18` | `-36` to `-6` | Target LUFS when `masterNormalize: true` |
 | `truePeakCeilingDb` | `-1.5` | `-6` to `0` | True-peak limiter ceiling (`dBTP`) |
 | `headphoneCrossfeed` | `true` | `boolean` | Phase-pure near-to-far head-shadow crossfeed on panned stems |
+| `leadInMs` | `0` | `0` to `30000` | Clean cold-open pre-roll of room tone/beds before the first cue |
 | `tailMs` | `2000` | `0` to `30000` | Quiet room-tone/bed tail appended after the final cue or SFX |
 
 ---
@@ -63,25 +64,28 @@ npm run build && npm start
 | :--- | :--- | :--- |
 | `POST` | `/projects/:id/cues/:cueId/render` | Synthesize a new immutable raw WAV take for one cue (`{ activate?: true, model? }`) |
 | `POST` | `/projects/:id/render-all` | Synthesize all cues missing an active take or with a stale `textHash` (`{ concurrency?: 2, force?: false, wait?: false }`). Returns `202` with `{ jobId, job }` (or `200` when `wait: true`) |
-| `GET` | `/jobs/:jobId` | Poll progress, completed count, errors, and results for an async `render-all` or `direct` job |
+| `GET` | `/jobs/:jobId` | Poll progress, completed count, errors, and results for an async `render-all`, `direct`, or `assets/index` job |
 | `GET` | `/projects/:id/cues/:cueId/takes/:takeId/audio` | Stream immutable raw take WAV (`Content-Type: audio/wav`) |
 
 ---
 
 ## Beds, SFX & Shared Asset Library
 
-All asset paths are sandboxed under `DATA_DIR/assets/` (path traversal is rejected) and validated via `ffprobe` on upload.
+Writable local assets live under `DATA_DIR/assets/` (path traversal is rejected and uploads are validated via `ffprobe`). External read-only SFX/bed libraries configured via `ASSET_LIBRARY_DIRS` are addressed as `@<alias>/<relative-path>` and reject writes/deletes with HTTP `403`.
 
 | Method | Path | Description |
 | :--- | :--- | :--- |
-| `PUT` | `/projects/:id/beds/:bedId` | Add or update a `synthetic_room_tone` or `asset_file` background bed with ducking settings |
+| `PUT` | `/projects/:id/beds/:bedId` | Add or update a `synthetic_room_tone` or `asset_file` background bed with ducking and optional source slicing (`clipStartMs`, `clipDurationMs`) |
 | `DELETE` | `/projects/:id/beds/:bedId` | Remove a bed track |
-| `PUT` | `/projects/:id/sfx/:sfxId` | Add or update a spot SFX anchored to a cue edge (`start` / `end`) or absolute `t=0` |
+| `PUT` | `/projects/:id/sfx/:sfxId` | Add or update a spot SFX anchored to a cue edge (`start` / `end`) or absolute `t=0`, with optional source slicing (`clipStartMs`, `clipDurationMs`) |
 | `DELETE` | `/projects/:id/sfx/:sfxId` | Remove a spot SFX event |
-| `GET` | `/assets` | List all audio files in `DATA_DIR/assets/` |
-| `POST` | `/assets` | Upload an asset as JSON (`{ assetPath, dataBase64 }`) |
-| `PUT` | `/assets/*` | Upload an asset as raw binary body (`Content-Type: audio/wav` or `application/octet-stream`) |
-| `DELETE` | `/assets/*` | Delete an asset from `DATA_DIR/assets/` (`204 No Content`) |
+| `GET` | `/assets` | List writable local audio files in `DATA_DIR/assets/` plus a `mounts` summary of configured external read-only libraries |
+| `POST` | `/assets/index` | Incrementally scan & index `DATA_DIR/assets/` + `ASSET_LIBRARY_DIRS` (`{ mounts?, forceReprobe?, concurrency?, enrichCaptions?, maxCaptionCount?, onlyMissingDescriptions?, enrichEmbeddings?, wait? }`). Returns `200` with `{ jobId, job, summary }` (or `202` with `{ jobId, job }` when `wait: false`) |
+| `GET` | `/assets/search` | Zero-DB offline BM25 / hybrid semantic search. Query params: `query` (or `q`), `kind` (`sfx \| bed \| any`), `mount`, `minDurationSec`, `maxDurationSec`, `stereoOnly`, `limit` |
+| `GET` | `/assets/audio` | Audition a local or `@<alias>/...` asset (or slice). Query params: `assetPath` *(required)*, `startSec`, `maxDurationSec` (`<= 30`), `format` (`binary` default \| `json`). Streams original audio when untouched & `<= 4 MB`, or fast-seeks (`-ss`) to compact `audio/ogg` Opus `96k` |
+| `POST` | `/assets` | Upload an asset into writable `DATA_DIR/assets/` as JSON (`{ assetPath, dataBase64 }`) |
+| `PUT` | `/assets/*` | Upload an asset into writable `DATA_DIR/assets/` as raw binary body (`Content-Type: audio/wav` or `application/octet-stream`) |
+| `DELETE` | `/assets/*` | Delete an asset from writable `DATA_DIR/assets/` (`204 No Content`) |
 
 ---
 
@@ -89,7 +93,7 @@ All asset paths are sandboxed under `DATA_DIR/assets/` (path traversal is reject
 
 | Method | Path | Description |
 | :--- | :--- | :--- |
-| `POST` | `/projects/:id/mix` | Run deterministic local FFmpeg stereo mixdown (`{ format?: "ogg" \| "wav" \| "mp3" }`, default `"ogg"`). Returns `{ export, telemetry }` including LUFS, true peak, per-channel L/R RMS, and warnings |
+| `POST` | `/projects/:id/mix` | Run deterministic local FFmpeg stereo mixdown (`{ format?: "ogg" \| "wav" \| "mp3", outputPath?, fromCueId?, toCueId?, startSec?, endSec? }`, default `"ogg"`). Returns `{ export, telemetry }` including LUFS, true peak, per-channel L/R RMS, optional `window`, and warnings |
 | `GET` | `/projects/:id/exports/:exportId/audio` | Stream or download the finished master (`audio/ogg`, `audio/wav`, or `audio/mpeg`) |
 | `GET` | `/projects/:id/exports/:exportId/visual` | Render visual-audio QC chart for a master export |
 | `GET` | `/projects/:id/cues/:cueId/takes/:takeId/visual` | Render visual-audio QC chart for a single take |

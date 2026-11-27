@@ -113,6 +113,33 @@ function parseKeyValueArgs(rawArgs: string): Record<string, string> {
 }
 
 /**
+ * Parses a directive target (unquoted token or single/double-quoted path supporting spaces)
+ * followed by optional key=value arguments.
+ */
+function parseTargetAndArgs(
+  value: string,
+  directiveLabel: string,
+  lineNumber: number,
+): { target: string; rawArgs: string } {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    throw new ScriptParseError(`[[${directiveLabel}:...]] requires an asset name`, lineNumber);
+  }
+  const match = trimmed.match(/^(?:"([^"]+)"|'([^']+)'|(\S+))(?:\s+(.*))?$/);
+  if (!match) {
+    throw new ScriptParseError(
+      `Invalid target in [[${directiveLabel}:...]]`,
+      lineNumber,
+    );
+  }
+  const target = (match[1] ?? match[2] ?? match[3] ?? '').trim();
+  if (!target) {
+    throw new ScriptParseError(`[[${directiveLabel}:...]] requires an asset name`, lineNumber);
+  }
+  return { target, rawArgs: match[4] ?? '' };
+}
+
+/**
  * Splits long text into chunks <= maxBytes UTF-8 without ever bisecting
  * inline angle-bracket tags like `<sigh>` or `<short pause>`.
  */
@@ -408,12 +435,8 @@ export function parseScript(
         break;
       }
       case 'bed': {
-        const parts = value.match(/^(\S+)(?:\s+(.*))?$/);
-        if (!parts) {
-          throw new ScriptParseError(`[[bed:...]] requires an asset name`, lineNumber);
-        }
-        const target = parts[1]!;
-        const kv = parseKeyValueArgs(parts[2] ?? '');
+        const { target, rawArgs } = parseTargetAndArgs(value, 'bed', lineNumber);
+        const kv = parseKeyValueArgs(rawArgs);
         bedCounter += 1;
         const bedId = makeId('bed', bedCounter);
 
@@ -454,6 +477,21 @@ export function parseScript(
           : 3000;
         const loop = kv.loop ? kv.loop.toLowerCase() !== 'false' : true;
 
+        let clipStartMs: number | undefined;
+        if (kv.clipstart !== undefined) {
+          clipStartMs = parseDurationMs(kv.clipstart, 's', lineNumber);
+          if (clipStartMs < 0) {
+            throw new ScriptParseError(`[[bed:...]] clipStart must be non-negative`, lineNumber);
+          }
+        }
+        let clipDurationMs: number | undefined;
+        if (kv.clipdur !== undefined) {
+          clipDurationMs = parseDurationMs(kv.clipdur, 's', lineNumber);
+          if (clipDurationMs <= 0) {
+            throw new ScriptParseError(`[[bed:...]] clipDur must be positive`, lineNumber);
+          }
+        }
+
         if (isRoomTone) {
           const styleResult = RoomToneStyleSchema.safeParse(
             (kv.style ?? 'warm_dark').toLowerCase(),
@@ -492,6 +530,8 @@ export function parseScript(
             loop,
             startMs: 0,
             endMs: null,
+            ...(clipStartMs !== undefined ? { clipStartMs } : {}),
+            ...(clipDurationMs !== undefined ? { clipDurationMs } : {}),
             fadeInMs,
             fadeOutMs,
             ducking: {
@@ -505,12 +545,8 @@ export function parseScript(
         break;
       }
       case 'sfx': {
-        const parts = value.match(/^(\S+)(?:\s+(.*))?$/);
-        if (!parts) {
-          throw new ScriptParseError(`[[sfx:...]] requires an asset name`, lineNumber);
-        }
-        const target = parts[1]!;
-        const kv = parseKeyValueArgs(parts[2] ?? '');
+        const { target, rawArgs } = parseTargetAndArgs(value, 'sfx', lineNumber);
+        const kv = parseKeyValueArgs(rawArgs);
         sfxCounter += 1;
         const sfxId = makeId('sfx', sfxCounter);
 
@@ -526,6 +562,21 @@ export function parseScript(
           ? parseDurationMs(kv.fadeout, 'ms', lineNumber)
           : 40;
         const anchorMode = (kv.anchor ?? 'prev').toLowerCase();
+
+        let clipStartMs: number | undefined;
+        if (kv.clipstart !== undefined) {
+          clipStartMs = parseDurationMs(kv.clipstart, 's', lineNumber);
+          if (clipStartMs < 0) {
+            throw new ScriptParseError(`[[sfx:...]] clipStart must be non-negative`, lineNumber);
+          }
+        }
+        let clipDurationMs: number | undefined;
+        if (kv.clipdur !== undefined) {
+          clipDurationMs = parseDurationMs(kv.clipdur, 's', lineNumber);
+          if (clipDurationMs <= 0) {
+            throw new ScriptParseError(`[[sfx:...]] clipDur must be positive`, lineNumber);
+          }
+        }
 
         if (anchorMode !== 'prev' && anchorMode !== 'next') {
           throw new ScriptParseError(
@@ -548,6 +599,8 @@ export function parseScript(
               },
               gainDb,
               pan,
+              ...(clipStartMs !== undefined ? { clipStartMs } : {}),
+              ...(clipDurationMs !== undefined ? { clipDurationMs } : {}),
               fadeInMs,
               fadeOutMs,
             },
@@ -565,6 +618,8 @@ export function parseScript(
             },
             gainDb,
             pan,
+            ...(clipStartMs !== undefined ? { clipStartMs } : {}),
+            ...(clipDurationMs !== undefined ? { clipDurationMs } : {}),
             fadeInMs,
             fadeOutMs,
           });

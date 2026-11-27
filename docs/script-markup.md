@@ -59,12 +59,18 @@ Because directives are **sticky** by default and unchanged takes are matched by 
 
 ## 3. Background Beds & Spot SFX
 
+Both `[[bed:...]]` and `[[sfx:...]]` resolve assets from two places:
+- **Writable local library (`DATA_DIR/assets/`):** unprefixed relative path, e.g. `rain_window.wav` or `foley/door_latch.wav` (extension optional).
+- **External read-only libraries (`ASSET_LIBRARY_DIRS`):** prefixed with `@<alias>/`, e.g. `@sonniss/Glass/GLASSBrk_Mirror_01.wav`.
+- **Filenames with spaces:** wrap the asset path in double or single quotes (e.g. `[[sfx:"@sonniss/Doors & Latches/Wood Creak 01.wav" ...]]`).
+
 ### Continuous Ambient Beds (`[[bed:...]]`)
 
-Attach a looped audio file from `DATA_DIR/assets/` or a synthetic room-tone layer:
+Attach a looped audio file from `DATA_DIR/assets/` or an external `@<alias>/` library, or add a synthetic room-tone layer:
 
 ```text
 [[bed:rain_window.wav gain=-26dB duck=-6dB attack=100ms release=800ms fadein=1500ms fadeout=3000ms]]
+[[bed:"@nps/Storm Wind Long.wav" clipStart=18s clipDur=45s gain=-26dB duck=-6dB]]
 [[bed:room_tone style=warm_dark gain=-54dB]]
 ```
 
@@ -76,24 +82,29 @@ Attach a looped audio file from `DATA_DIR/assets/` or a synthetic room-tone laye
 | `release` | `800ms` | Ducking release time when speech pauses |
 | `fadein` | `1500ms` | Bed fade-in at track start |
 | `fadeout` | `3000ms` | Bed fade-out at track tail |
-| `loop` | `true` | Loop asset to cover full project duration (`true` / `false`) |
+| `loop` | `true` | Loop asset (or the sliced `clipStart`/`clipDur` window) to cover full project duration (`true` / `false`) |
+| `clipStart` | *(none)* | Optional non-destructive source-file start offset (`s` or `ms`, e.g. `18s`, `1500ms`) |
+| `clipDur` | *(none)* | Optional non-destructive source-file clip duration (`s` or `ms`, e.g. `45s`, `8000ms`) |
 | `style` | `warm_dark` | For `room_tone` only: `warm_dark` (brown noise `< 2.4 kHz`) or `soft_pink` (pink noise `< 3.2 kHz`) |
 
 ### Anchored Sound Effects (`[[sfx:...]]`)
 
-Drop spot foley from `DATA_DIR/assets/` anchored to either the **previous cue's end** (`anchor=prev`, default) or the **next cue's start** (`anchor=next`, ideal for pre-laps after a long silence):
+Drop spot foley from `DATA_DIR/assets/` or `@<alias>/` anchored to either the **previous cue's end** (`anchor=prev`, default) or the **next cue's start** (`anchor=next`, ideal for pre-laps after a long silence):
 
 ```text
 [[sfx:door_latch.wav gain=-10dB pan=0.4 offset=150ms]]
 [[sfx:sheets_rustle.wav anchor=next offset=-500ms gain=-14dB pan=-0.3]]
+[[sfx:"@sonniss/Glass/GLASSBrk Mirror x4.wav" clipStart=3.1s clipDur=1.4s anchor=next offset=-250ms gain=-8dB pan=0.35]]
 ```
 
 | Option | Default | Description |
 | :--- | :--- | :--- |
 | `anchor` | `prev` | `prev` anchors to the end of the preceding cue (`t=0` if first); `next` anchors to the start of the upcoming cue |
 | `offset` | `0ms` | Millisecond (or `s`) shift from anchor edge—negative values pre-lap |
-| `gain` | `-6dB` | SFX gain (`-48dB` to `+12dB`) |
+| `gain` | `-6dB` | SFX gain (`-48dB` to `+12dB`); typical everyday foley sits around `-10dB` to `-18dB` |
 | `pan` | `0` | Stereo placement (`-1.0..+1.0` or preset name) |
+| `clipStart` | *(none)* | Optional source-file start offset (`s` or `ms`) to isolate a single hit inside a multi-variation WAV |
+| `clipDur` | *(none)* | Optional source-file clip duration (`s` or `ms`); also used for timeline tail estimation so unused source tails don't inflate project length |
 | `fadein` | `15ms` | Edge de-click fade-in |
 | `fadeout` | `40ms` | Edge de-click fade-out |
 

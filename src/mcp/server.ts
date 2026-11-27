@@ -132,7 +132,7 @@ export function createMcpServer(service: StudioService): McpServer {
     'booth_update_project',
     {
       description:
-        'Update project name or Stage-2 master audio settings (autoLevel, headphoneCrossfeed, masterNormalize, tailMs, etc.).',
+        'Update project name or Stage-2 master audio settings (autoLevel, headphoneCrossfeed, masterNormalize, leadInMs, tailMs, etc.).',
       inputSchema: {
         projectId: SafeIdSchema.describe('Project ID'),
         name: z.string().min(1).optional(),
@@ -273,6 +273,42 @@ export function createMcpServer(service: StudioService): McpServer {
       }),
   );
 
+  server.registerTool(
+    'booth_split_cue',
+    {
+      description:
+        'Non-destructively split a rendered cue at playhead timestamp `atMs` (relative to the cue start) into two sequential cues sharing the exact same immutable raw WAV take, inserting `gapMs` of warm room tone between them with zero TTS re-synthesis. Ideal for inserting or adjusting dramatic pauses mid-line after locating the exact beat with booth_inspect_visual.',
+      inputSchema: {
+        projectId: SafeIdSchema.describe('Project ID'),
+        cueId: SafeIdSchema.describe('Rendered cue ID to split'),
+        atMs: z
+          .number()
+          .int()
+          .min(50)
+          .describe('Split playhead offset in milliseconds from the start of this cue'),
+        gapMs: z
+          .number()
+          .int()
+          .min(-5000)
+          .max(60000)
+          .optional()
+          .describe('Pause inserted between the two halves in milliseconds (default: 400)'),
+        secondCueId: SafeIdSchema.optional().describe('Optional custom ID for the second half'),
+        textBefore: z.string().min(1).optional().describe('Optional transcript label for part 1'),
+        textAfter: z.string().min(1).optional().describe('Optional transcript label for part 2'),
+      },
+    },
+    ({ projectId, cueId, ...input }) =>
+      runTool(async () => {
+        const { firstCue, secondCue, splitAtRawMs, gapMs } = await service.splitCue(
+          projectId,
+          cueId,
+          input,
+        );
+        return jsonOk({ firstCue, secondCue, splitAtRawMs, gapMs });
+      }),
+  );
+
   // --- Stage 1 Synthesis ---
   server.registerTool(
     'booth_render_take',
@@ -402,7 +438,7 @@ export function createMcpServer(service: StudioService): McpServer {
     'booth_upsert_bed',
     {
       description:
-        'Add or update a continuous background bed track (synthetic_room_tone or looped asset_file with optional speech ducking).',
+        'Add or update a continuous background bed track (synthetic_room_tone or looped asset_file with optional speech ducking and raw-ms or cue-anchored startCueId/endCueId boundaries).',
       inputSchema: {
         projectId: SafeIdSchema.describe('Project ID'),
         bedId: SafeIdSchema.describe('Bed ID'),
@@ -414,6 +450,46 @@ export function createMcpServer(service: StudioService): McpServer {
         loop: z.boolean().default(true),
         startMs: z.number().int().min(0).optional(),
         endMs: z.number().int().min(0).nullable().optional(),
+        startCueId: z
+          .string()
+          .nullable()
+          .optional()
+          .describe('Optional cue ID anchoring when this bed enters (overrides startMs; survives upstream pause edits)'),
+        startEdge: z
+          .enum(['start', 'end'])
+          .optional()
+          .describe('Edge of startCueId to anchor to (default: "start")'),
+        startOffsetMs: z
+          .number()
+          .int()
+          .optional()
+          .describe('Millisecond offset relative to startCueId edge (e.g. -1000 to fade in 1s early; default: 0)'),
+        endCueId: z
+          .string()
+          .nullable()
+          .optional()
+          .describe('Optional cue ID anchoring when this bed exits (overrides endMs; survives upstream pause edits)'),
+        endEdge: z
+          .enum(['start', 'end'])
+          .optional()
+          .describe('Edge of endCueId to anchor to (default: "end")'),
+        endOffsetMs: z
+          .number()
+          .int()
+          .optional()
+          .describe('Millisecond offset relative to endCueId edge (e.g. +1500 to trail past the final line; default: 0)'),
+        clipStartMs: z
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe('Optional source-file start offset in milliseconds for non-destructive slicing'),
+        clipDurationMs: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe('Optional source-file clip duration in milliseconds (looped if loop=true)'),
         fadeInMs: z.number().int().min(0).max(30000).default(1500),
         fadeOutMs: z.number().int().min(0).max(30000).default(3000),
         ducking: BedDuckingSchema.default({
@@ -460,6 +536,18 @@ export function createMcpServer(service: StudioService): McpServer {
         anchor: SfxAnchorSchema.default({ edge: 'end', offsetMs: 0 }),
         gainDb: z.number().min(-48).max(12).default(-6),
         pan: z.number().min(-1).max(1).default(0),
+        clipStartMs: z
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe('Optional source-file start offset in milliseconds (for slicing single hits from multi-variation WAVs)'),
+        clipDurationMs: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe('Optional source-file clip duration in milliseconds'),
         fadeInMs: z.number().int().min(0).max(5000).default(15),
         fadeOutMs: z.number().int().min(0).max(5000).default(40),
       },
@@ -492,18 +580,59 @@ export function createMcpServer(service: StudioService): McpServer {
     'booth_mix',
     {
       description:
-        'Run Stage-2 local deterministic stereo mixdown (zero API cost) and return the export record and loudness/channel telemetry.',
+        'Run Stage-2 local deterministic stereo mixdown (zero API cost) and return the export record and loudness/channel telemetry. Pass optional outputPath to deliver a playable master copy directly into your workspace, or optional fromCueId/toCueId (or startSec/endSec) for a fast scene-scoped partial mixdown.',
       inputSchema: {
         projectId: SafeIdSchema.describe('Project ID'),
-        format: ExportFormatSchema.default('ogg').describe('Output format: ogg, wav, or mp3'),
+        format: ExportFormatSchema.optional().describe(
+          'Output format: ogg, wav, or mp3 (defaults to ogg, or inferred from outputPath extension if provided)',
+        ),
+        outputPath: z
+          .string()
+          .min(1)
+          .optional()
+          .describe(
+            'Optional delivery file path (e.g. "/path/to/scene_master.ogg") or destination directory; atomically writes a ready-to-play copy alongside the canonical project export',
+          ),
+        fromCueId: SafeIdSchema.optional().describe(
+          'Optional first cue ID for a scene-scoped partial mixdown (mutually exclusive with startSec/endSec)',
+        ),
+        toCueId: SafeIdSchema.optional().describe(
+          'Optional last cue ID for a scene-scoped partial mixdown (mutually exclusive with startSec/endSec)',
+        ),
+        startSec: z
+          .number()
+          .min(0)
+          .optional()
+          .describe(
+            'Optional start timestamp in seconds on the full timeline for a partial mixdown',
+          ),
+        endSec: z
+          .number()
+          .positive()
+          .optional()
+          .describe(
+            'Optional end timestamp in seconds on the full timeline for a partial mixdown',
+          ),
       },
     },
-    ({ projectId, format }) =>
+    ({ projectId, format, outputPath, fromCueId, toCueId, startSec, endSec }) =>
       runTool(async () => {
-        const { exportRecord, telemetry } = await service.mixProject(projectId, {
-          format,
+        const { exportRecord, telemetry, deliveredPath } = await service.mixProject(
+          projectId,
+          {
+            format,
+            outputPath,
+            fromCueId,
+            toCueId,
+            startSec,
+            endSec,
+          },
+        );
+        return jsonOk({
+          export: exportRecord,
+          telemetry,
+          ...(deliveredPath ? { deliveredPath } : {}),
         });
-        return jsonOk({ export: exportRecord, telemetry });
       }),
   );
 
@@ -562,7 +691,7 @@ export function createMcpServer(service: StudioService): McpServer {
     'booth_inspect_visual',
     {
       description:
-        'Render a calibrated visual-audio inspection chart (1600x900 PNG + metadata) for an export, take, audition, or asset so multimodal agents can see stereo L/R panning, room-tone dropouts, broadband clicks, loudness jumps (>= 1.5 dB), overlaps, and silent-tail mismatches. Default preset "master" renders the 4-panel stack: DAW Cue Overlay + Split L/R Waveforms + Split L/R & Combined 300ms RMS (3 dB grid) + Log-Mel Spectrogram; preset "fast" uses zero-JS pure FFmpeg (showwavespic + showspectrumpic). Windowing: default zoom <= 45s (>= 30 px/s) for seam/dropout/overlap QC; use mode "overview" for macro arcs & click spotting on 180s+ tracks (<150 ms dropouts/overlaps fall below the pixel cliff at 180s). USAGE GUARDRAIL: Inspect 1-2 charts per turn to prevent multi-image batch swaps, and always pair ears (booth_get_export_audio / booth_get_take_audio) + eyes (booth_inspect_visual) on final mixes.',
+        'Render a calibrated visual-audio inspection chart (1600x900 PNG + metadata) for an export, take, audition, or asset so multimodal agents can see stereo L/R panning, room-tone dropouts, broadband clicks, loudness jumps (>= 1.5 dB), overlaps, SFX sync alignment, and silent-tail mismatches. Default preset "master" renders the 4-panel stack: DAW Cue + SFX Overlay + Split L/R Waveforms + Split L/R & Combined 300ms RMS (3 dB grid) + Log-Mel Spectrogram; preset "fast" uses zero-JS pure FFmpeg (showwavespic + showspectrumpic). Windowing: default zoom <= 45s (>= 30 px/s) for seam/dropout/overlap QC; use mode "overview" for macro arcs & click spotting on 180s+ tracks (<150 ms dropouts/overlaps fall below the pixel cliff at 180s). USAGE GUARDRAIL: Inspect 1-2 charts per turn to prevent multi-image batch swaps, and always pair ears (booth_get_export_audio / booth_get_take_audio) + eyes (booth_inspect_visual) on final mixes.',
       inputSchema: {
         projectId: SafeIdSchema.optional().describe(
           'Project ID (required for export, take, and audition targets; omit for shared asset targets)',
@@ -584,7 +713,10 @@ export function createMcpServer(service: StudioService): McpServer {
           }),
           z.object({
             type: z.literal('asset'),
-            assetPath: z.string().min(1).describe('Relative path under DATA_DIR/assets/'),
+            assetPath: z
+              .string()
+              .min(1)
+              .describe('Relative path under DATA_DIR/assets/ or "@<alias>/<path>" in a mounted external library'),
           }),
         ]),
         preset: z
@@ -646,12 +778,186 @@ export function createMcpServer(service: StudioService): McpServer {
     'booth_list_assets',
     {
       description:
-        'List all reusable ambient beds and sound effects stored in the studio asset library.',
+        'List reusable ambient beds and sound effects stored in the writable local asset library (DATA_DIR/assets/), along with a summary of configured read-only external library mounts (use booth_search_assets to search external libraries).',
     },
     () =>
       runTool(async () => {
-        const assets = await service.listAssets();
-        return jsonOk({ assets });
+        const [assets, mounts] = await Promise.all([
+          service.listAssets(),
+          service.listAssetMountsSummary(),
+        ]);
+        return jsonOk({ assets, mounts });
+      }),
+  );
+
+  server.registerTool(
+    'booth_index_assets',
+    {
+      description:
+        'Incrementally scan and index DATA_DIR/assets/ plus configured read-only ASSET_LIBRARY_DIRS mounts into a zero-DB local manifest (ffprobe duration/channels + astats rmsDbfs/peakDbfs loudness telemetry + BWF/INFO/ID3/Vorbis tags + UCS tokenization + catalog.json sidecars). Optionally runs bounded Gemini audio captioning and/or gemini-embedding-2 semantic embeddings (cached forever). Set wait=false for large first-time scans and poll booth_job_status.',
+      inputSchema: {
+        mounts: z
+          .array(z.string().min(1))
+          .optional()
+          .describe('Optional subset of mount aliases to scan (e.g. ["local", "sonniss"]); omit to scan all'),
+        forceReprobe: z
+          .boolean()
+          .optional()
+          .describe('Re-probe all files even if size and mtime are unchanged (default: false)'),
+        concurrency: z
+          .number()
+          .int()
+          .min(1)
+          .max(16)
+          .optional()
+          .describe('Bounded ffprobe concurrency (default: 6)'),
+        enrichCaptions: z
+          .boolean()
+          .optional()
+          .describe('Opt-in Gemini audio auto-captioning for assets missing descriptions (default: false)'),
+        maxCaptionCount: z
+          .number()
+          .int()
+          .min(1)
+          .max(500)
+          .optional()
+          .describe('Maximum number of assets to caption in one run (default: 50)'),
+        onlyMissingDescriptions: z
+          .boolean()
+          .optional()
+          .describe('When enrichCaptions=true, skip assets that already have BWF or catalog.json descriptions (default: true)'),
+        enrichEmbeddings: z
+          .boolean()
+          .optional()
+          .describe('Opt-in gemini-embedding-2 semantic vector generation into flat assets_embeddings.f32 (default: false)'),
+        wait: z
+          .boolean()
+          .optional()
+          .describe('Wait for indexing to finish before returning (default: true); pass false to return a jobId immediately'),
+      },
+    },
+    ({ wait, ...opts }) =>
+      runTool(async () => {
+        const { job, done } = await service.startIndexAssets(opts);
+        if (wait === false) {
+          done.catch(() => {});
+          return jsonOk({ jobId: job.id, job });
+        }
+        const finished = await done;
+        return jsonOk({
+          jobId: finished.job.id,
+          job: finished.job,
+          summary: finished.summary,
+        });
+      }),
+  );
+
+  server.registerTool(
+    'booth_search_assets',
+    {
+      description:
+        'Fast zero-DB BM25 / hybrid semantic search across indexed local assets and read-only external SFX/bed mounts. Narrow candidates with kind, mount, duration, and stereoOnly filters, then audition top hits with booth_get_asset_audio before committing them to a mix.',
+      inputSchema: {
+        query: z
+          .string()
+          .min(1)
+          .describe('Natural-language or keyword query (e.g. "sharp mirror glass shatter", "howling castle wind")'),
+        kind: z
+          .enum(['sfx', 'bed', 'any'])
+          .optional()
+          .describe('Filter by spot foley ("sfx"), continuous ambient bed ("bed"), or "any" (default)'),
+        mount: z
+          .string()
+          .min(1)
+          .optional()
+          .describe('Restrict to "local" or an external mount alias (e.g. "sonniss")'),
+        minDurationSec: z
+          .number()
+          .min(0)
+          .optional()
+          .describe('Minimum asset duration in seconds'),
+        maxDurationSec: z
+          .number()
+          .min(0)
+          .optional()
+          .describe('Maximum asset duration in seconds'),
+        stereoOnly: z
+          .boolean()
+          .optional()
+          .describe('Only return stereo (2+ channel) assets'),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(25)
+          .optional()
+          .describe('Maximum results to return (default: 8, max: 25)'),
+      },
+    },
+    (args) =>
+      runTool(async () => {
+        return jsonOk(await service.searchAssets(args));
+      }),
+  );
+
+  server.registerTool(
+    'booth_get_asset_audio',
+    {
+      description:
+        'Audition a local or "@<alias>/..." external asset (or a [startSec, startSec+maxDurationSec] slice) via inline MCP audio block plus local filePath and cached previewAudioPath metadata so you can verify foley and rule out acoustic twins before placing it in a mix.',
+      inputSchema: {
+        assetPath: z
+          .string()
+          .min(1)
+          .describe('Local asset path (e.g. "rain_window.wav") or external mount path (e.g. "@sonniss/Glass/GLASSBrk_Mirror_01.wav")'),
+        startSec: z
+          .number()
+          .min(0)
+          .optional()
+          .describe('Optional start offset in seconds for auditioning inside long or multi-variation files (default: 0)'),
+        maxDurationSec: z
+          .number()
+          .positive()
+          .max(30)
+          .optional()
+          .describe('Maximum preview clip length in seconds (default: 15, max: 30)'),
+        inlineAudio: z
+          .boolean()
+          .optional()
+          .describe('Include base64 audio block in MCP response (default: true when <= 10 MB)'),
+      },
+    },
+    ({ assetPath, startSec, maxDurationSec, inlineAudio }) =>
+      runTool(async () => {
+        const preview = await service.getAssetAudio({
+          assetPath,
+          startSec,
+          maxDurationSec,
+        });
+        const includeInline =
+          inlineAudio !== false && preview.audioBuffer.length <= MAX_INLINE_AUDIO_BYTES;
+        const { audioBuffer, ...meta } = preview;
+        const content: CallToolResult['content'] = [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                ...meta,
+                inlineAudioIncluded: includeInline,
+              },
+              null,
+              2,
+            ),
+          },
+        ];
+        if (includeInline) {
+          content.push({
+            type: 'audio',
+            data: audioBuffer.toString('base64'),
+            mimeType: preview.mimeType,
+          });
+        }
+        return { content };
       }),
   );
 
@@ -873,7 +1179,7 @@ export function createMcpServer(service: StudioService): McpServer {
     'booth_audition_voice',
     {
       description:
-        'Generate audition clips for one or more candidate providerVoiceIds on a project voice role.',
+        'Generate labeled audition clips ("A", "B", ...) for candidate providerVoiceIds on a project voice role. When 2+ candidates are supplied, automatically renders a single loudness-matched playable A/B comparison reel (set reelOutputPath to deliver it straight to your workspace) so you can compare candidates in one file and select by "A" or "B".',
       inputSchema: {
         projectId: SafeIdSchema,
         voiceId: SafeIdSchema,
@@ -883,11 +1189,136 @@ export function createMcpServer(service: StudioService): McpServer {
         notes: z.string().optional(),
         provider: z.string().min(1).optional(),
         model: z.string().min(1).optional(),
+        renderReel: z
+          .boolean()
+          .optional()
+          .describe('Render a loudness-matched labeled A/B audition reel (default: true when >= 2 candidates)'),
+        reelFormat: ExportFormatSchema.optional(),
+        reelOutputPath: z
+          .string()
+          .min(1)
+          .optional()
+          .describe('Optional delivery file path or directory for the A/B audition reel'),
       },
     },
     ({ projectId, voiceId, ...input }) =>
       runTool(async () => {
         return jsonOk(await service.auditionVoice(projectId, voiceId, input));
+      }),
+  );
+
+  server.registerTool(
+    'booth_render_audition_reel',
+    {
+      description:
+        'Stitch a role\'s voice auditions into a single loudness-matched labeled A/B comparison reel ("A", "B", ...) with soft musical cue pips and warm room tone. Supports direct delivery via outputPath and optional inline MCP audio.',
+      inputSchema: {
+        projectId: SafeIdSchema,
+        voiceId: SafeIdSchema,
+        auditionIds: z.array(SafeIdSchema).min(1).max(10).optional(),
+        format: ExportFormatSchema.optional(),
+        outputPath: z
+          .string()
+          .min(1)
+          .optional()
+          .describe('Optional delivery file path or directory for the playable reel'),
+        inlineAudio: z
+          .boolean()
+          .optional()
+          .describe('Include base64 audio block in MCP response (default: true when <= 10 MB)'),
+      },
+    },
+    ({ projectId, voiceId, inlineAudio, ...opts }) =>
+      runTool(async () => {
+        const reel = await service.renderAuditionReel(projectId, voiceId, opts);
+        const bytes = await fs.readFile(reel.reelPath);
+        const includeInline =
+          inlineAudio !== false && bytes.length <= MAX_INLINE_AUDIO_BYTES;
+        const content: CallToolResult['content'] = [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              { ...reel, sizeBytes: bytes.length, inlineAudioIncluded: includeInline },
+              null,
+              2,
+            ),
+          },
+        ];
+        if (includeInline) {
+          content.push({
+            type: 'audio',
+            data: bytes.toString('base64'),
+            mimeType: mimeTypeForFormat(reel.format),
+          });
+        }
+        return { content };
+      }),
+  );
+
+  server.registerTool(
+    'booth_render_ab_reel',
+    {
+      description:
+        'Play multiple takes of a cue IN CONTEXT as a single loudness-matched, labeled A/B stereo comparison reel (e.g. preceding lead-in cue + Take A, gentle separator chime, same lead-in + Take B). Ideal for comparing retakes in scene context and sharing a single playable file across any MCP host.',
+      inputSchema: {
+        projectId: SafeIdSchema,
+        cueId: SafeIdSchema,
+        takeIds: z
+          .array(SafeIdSchema)
+          .min(1)
+          .max(6)
+          .optional()
+          .describe('Take IDs to compare (defaults to the 2 most recent takes on this cue)'),
+        contextBeforeCues: z
+          .number()
+          .int()
+          .min(0)
+          .max(3)
+          .optional()
+          .describe('Number of preceding cues to include as lead-in context (default: 1)'),
+        contextAfterCues: z
+          .number()
+          .int()
+          .min(0)
+          .max(2)
+          .optional()
+          .describe('Number of following cues to include as reaction context (default: 0)'),
+        format: ExportFormatSchema.optional(),
+        outputPath: z
+          .string()
+          .min(1)
+          .optional()
+          .describe('Optional delivery file path or directory for the playable A/B reel'),
+        inlineAudio: z
+          .boolean()
+          .optional()
+          .describe('Include base64 audio block in MCP response (default: true when <= 10 MB)'),
+      },
+    },
+    ({ projectId, cueId, inlineAudio, ...opts }) =>
+      runTool(async () => {
+        const reel = await service.renderTakeComparisonReel(projectId, cueId, opts);
+        const bytes = await fs.readFile(reel.reelPath);
+        const includeInline =
+          inlineAudio !== false && bytes.length <= MAX_INLINE_AUDIO_BYTES;
+        const content: CallToolResult['content'] = [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              { ...reel, sizeBytes: bytes.length, inlineAudioIncluded: includeInline },
+              null,
+              2,
+            ),
+          },
+        ];
+        if (includeInline) {
+          content.push({
+            type: 'audio',
+            data: bytes.toString('base64'),
+            mimeType: mimeTypeForFormat(reel.format),
+          });
+        }
+        return { content };
       }),
   );
 
@@ -938,11 +1369,14 @@ export function createMcpServer(service: StudioService): McpServer {
     'booth_select_audition',
     {
       description:
-        'Cast an auditioned candidate voice onto a project voice profile (updates providerVoiceId).',
+        'Cast an auditioned candidate voice onto a project voice profile (updates providerVoiceId). Accepts either a friendly reel label ("A", "B", ...) from the latest audition batch OR an exact audition ID.',
       inputSchema: {
         projectId: SafeIdSchema,
         voiceId: SafeIdSchema,
-        auditionId: SafeIdSchema,
+        auditionId: z
+          .string()
+          .min(1)
+          .describe('Audition ID (e.g. "aud_...") OR friendly reel label (e.g. "A", "B")'),
       },
     },
     ({ projectId, voiceId, auditionId }) =>
@@ -965,11 +1399,26 @@ export function createMcpServer(service: StudioService): McpServer {
       }),
   );
 
+  const formatDirectCueForMcp = (
+    res: Awaited<ReturnType<StudioService['directCue']>>,
+    includeScores = false,
+  ) => {
+    if (includeScores) return res;
+    const { bestScore: _omitBest, attempts, ...rest } = res;
+    return {
+      ...rest,
+      attempts: attempts.map((a) => {
+        const { score: _omitScore, ...verdictRest } = a.verdict;
+        return { ...a, verdict: verdictRest };
+      }),
+    };
+  };
+
   server.registerTool(
     'booth_direct_cue',
     {
       description:
-        'Run the multimodal Director review & bounded retake loop on a single cue, steered by a built-in or custom Director persona.',
+        'Run the multimodal Director review & bounded retake loop on a single cue, steered by a built-in or custom Director persona. Returns decision-first observation, changeSummary, and timestamped listening moments at the top (numeric /10 scores are hidden by default unless includeScores=true).',
       inputSchema: {
         projectId: SafeIdSchema,
         cueId: SafeIdSchema,
@@ -983,11 +1432,16 @@ export function createMcpServer(service: StudioService): McpServer {
         allowMixAdjustments: z.boolean().optional(),
         allowTextTagTweaks: z.boolean().optional(),
         ttsModel: z.string().min(1).optional(),
+        includeScores: z
+          .boolean()
+          .optional()
+          .describe('Include internal numeric 1-10 scores (default: false — prioritizes concrete observations and timestamped moments)'),
       },
     },
-    ({ projectId, cueId, ...opts }) =>
+    ({ projectId, cueId, includeScores, ...opts }) =>
       runTool(async () => {
-        return jsonOk(await service.directCue(projectId, cueId, opts));
+        const res = await service.directCue(projectId, cueId, opts);
+        return jsonOk(formatDirectCueForMcp(res, includeScores === true));
       }),
   );
 
@@ -1010,15 +1464,28 @@ export function createMcpServer(service: StudioService): McpServer {
         allowMixAdjustments: z.boolean().optional(),
         allowTextTagTweaks: z.boolean().optional(),
         ttsModel: z.string().min(1).optional(),
+        includeScores: z
+          .boolean()
+          .optional()
+          .describe('Include internal numeric 1-10 scores in results (default: false)'),
         wait: z.boolean().optional(),
       },
     },
-    ({ projectId, wait, ...opts }) =>
+    ({ projectId, wait, includeScores, ...opts }) =>
       runTool(async () => {
         const { job, done } = await service.startDirectProject(projectId, opts);
         if (wait) {
           const finished = await done;
-          return jsonOk({ jobId: finished.job.id, ...finished });
+          return jsonOk({
+            jobId: finished.job.id,
+            job: finished.job,
+            result: {
+              ...finished.result,
+              results: finished.result.results.map((r) =>
+                formatDirectCueForMcp(r, includeScores === true),
+              ),
+            },
+          });
         }
         done.catch(() => {});
         return jsonOk({ jobId: job.id, job });

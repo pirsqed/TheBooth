@@ -10,7 +10,7 @@ Most TTS scripts stitch raw API clips straight to digital silence—resulting in
 
 ## Who Is This For?
 
-- **AI Agents & Agent Platforms (MCP):** Give a multimodal agent its own recording studio. Connect The Booth over stdio MCP (`34` tools) so an agent can design or audition voices, block scenes, listen to takes by ear, inspect stereo mixes visually, and master finished audio end-to-end.
+- **AI Agents & Agent Platforms (MCP):** Give a multimodal agent its own recording studio. Connect The Booth over stdio MCP (`40` tools) so an agent can design or audition voices, block scenes, search & audition external SFX libraries, listen to takes by ear, inspect stereo mixes visually, and master finished audio end-to-end.
 - **Audio Drama, Fiction & Spoken-Word Creators:** Write in readable, screenplay-style tagged scripts (`[[dir:...]]`, `[[overlap:350]]`, `[[pan:-0.6]]`, `[[eq:intimate]]`, `[[bed:...]]`, `[[sfx:...]]`) instead of wrestling with timelines or raw FFmpeg commands.
 - **Late-Night, Sleep, Meditation & PMR Authors:** Built with headphone comfort as a first-class rule—continuous warm room tone so long pauses never drop into digital vacuum, gentle leveling that protects whispers, and optional master normalization off by default so quiet fade-outs stay quiet.
 - **Developers & Voice-App Builders:** Integrate a clean, filesystem-backed REST API (`project.json` + immutable WAV takes) with a provider-agnostic `TtsProvider` interface, reference **Gemini 3.8 Flash TTS** adapter, and an offline `MockTtsProvider` for deterministic zero-cost testing.
@@ -50,6 +50,7 @@ flowchart LR
 | **Dialogue Overlaps & Micro-Fades** | Supports negative cue offsets (`[[overlap:350]]`) for natural interruptions, plus gentle cosine edge fades (`20 ms` in / `30 ms` out) so clips never click and soft inhales are never clipped. |
 | **Speech-Triggered Bed Ducking** | Continuous ambient beds (rain, fireplace, music) smoothly duck underneath the unified speech bus (`attack: 100 ms`, `release: 800 ms`) and bloom back up during pauses. |
 | **Take Preservation on Re-Import** | Each take hashes `(text + direction + providerVoiceId)`. Re-importing an edited script in `replace` mode automatically preserves and re-attaches unchanged takes—fixing a typo or pause never re-renders the whole script. |
+| **External SFX & Foley Slicing** | Mount read-only external SFX/bed folders via `ASSET_LIBRARY_DIRS` (`@alias/...`), index locally with zero DB (`ffprobe` + BWF/ID3 tags + UCS + `catalog.json` + optional Gemini captions/embeddings), audition slices with `booth_get_asset_audio`, and non-destructively trim single hits (`clipStart`/`clipDur`) out of multi-variation WAV packs. |
 | **Eyes + Ears QC** | Multimodal audio encoders downmix stereo to mono. `booth_inspect_visual` renders calibrated `1600×900` 4-panel charts (DAW cue overlay, split L/R waveforms, 300 ms RMS curves on a 3 dB grid, and Log-Mel spectrogram) so agents can verify stereo blocking and spot clicks, clipping, or dropouts visually. |
 
 ---
@@ -115,7 +116,7 @@ Build once (`npm run build`), then register The Booth in your MCP client config 
 
 *(If `GEMINI_API_KEY` is in `.env` inside `cwd`, it loads automatically. Otherwise pass `"GEMINI_API_KEY"` in `env`.)*
 
-Once connected, your agent gets **34 MCP tools** covering the full production pipeline—projects, script import, voice catalog/design/auditioning, Stage-1 synthesis, inline audio listening (`audio/wav` / `audio/ogg`), beds & SFX, Stage-2 mixdown, automated Director review, and visual-audio inspection (`image/png`).
+Once connected, your agent gets **40 MCP tools** covering the full production pipeline—projects, script import, voice catalog/design/auditioning, Stage-1 synthesis, inline audio listening (`audio/wav` / `audio/ogg`), external SFX library indexing/search/auditioning, beds & non-destructive SFX slicing, Stage-2 mixdown, automated Director review, and visual-audio inspection (`image/png`).
 
 #### Companion Agent Skill & Director Persona
 
@@ -172,8 +173,8 @@ I told you what I thought was true. <short pause> Sit down, Mara.
 | `[[pan:<val>]]` | Sticky | `[[pan:-0.6]]`, `left`, `right`, `center`, `hard-left`, `hard-right` |
 | `[[eq:<preset>]]` | Sticky | `neutral`, `intimate`, `whisper`, `phone`, `radio`, `distant` |
 | `[[autolevel:<mode>]]` | Sticky | `gentle`, `match`, `off`, `reset` |
-| `[[bed:<asset\|room_tone> ...]]` | Project | `[[bed:rain.wav gain=-24dB duck=-6dB]]` |
-| `[[sfx:<asset> ...]]` | Anchored | `[[sfx:door.wav anchor=next offset=-500ms pan=0.4]]` |
+| `[[bed:<asset\|room_tone> ...]]` | Project | `[[bed:"@nps/Storm Wind.wav" clipStart=18s clipDur=45s gain=-26dB duck=-6dB]]` |
+| `[[sfx:<asset> ...]]` | Anchored | `[[sfx:@sonniss/Glass/GLASSBrk_x4.wav clipStart=3.1s clipDur=1.4s anchor=next offset=-400ms pan=0.4]]` |
 
 Read the complete authoring guide (including EQ/pan tables and full genre examples) in **[docs/script-markup.md](./docs/script-markup.md)**.
 
@@ -256,6 +257,10 @@ Copy `.env.example` to `.env`. All settings are validated at startup via Zod (`s
 | `GEMINI_DIRECTOR_MODEL` | `gemini-3.5-flash` | Default multimodal model for Director take review |
 | `GEMINI_SAFETY_THRESHOLD` | `off` | Gemini safety setting (`off`, `block_none`, `block_only_high`, `block_medium_and_above`, `block_low_and_above`) |
 | `ALLOW_CUSTOM_FFMPEG_FILTER` | `false` | Opt-in flag allowing per-cue `mix.customFfmpegFilter` strings |
+| `ALLOWED_EXPORT_DIRS` | *(unset)* | Optional path-delimiter-separated root directories restricting `booth_mix` `outputPath` delivery |
+| `ASSET_LIBRARY_DIRS` | *(unset)* | Optional path-delimiter-separated read-only external SFX/bed library roots (`alias=path`, `;` on Windows / `:` on POSIX) |
+| `GEMINI_EMBEDDING_MODEL` | `gemini-embedding-2` | Optional Gemini embedding model for hybrid semantic asset search |
+| `ASSET_EMBEDDING_DIMS` | `256` | Matryoshka embedding dimensions (`128–3072`) for flat `assets_embeddings.f32` search |
 
 ---
 
@@ -265,7 +270,9 @@ Projects live in portable, human-inspectable directories under `DATA_DIR` (gitig
 
 ```text
 data/
-  assets/                        # Shared reusable beds & SFX (sandboxed, no path traversal)
+  assets/                        # Writable reusable beds & SFX (sandboxed, no path traversal)
+  assets_index.json              # Zero-DB local + external SFX index manifest
+  assets_embeddings.f32          # Optional flat L2-normalized Float32 embedding matrix
   voice_previews/                # Cached sample_audio WAVs for custom designed voices
   projects/
     <projectId>/
@@ -283,13 +290,13 @@ data/
 
 Core modules and agent assets live under:
 
-- `src/studio/` — Core `StudioService`, atomic `ProjectStore` (per-project mutex), async `JobTracker`
+- `src/studio/` — Core `StudioService`, atomic `ProjectStore` (per-project mutex & read-only `@alias` mounts), zero-DB `AssetIndexService`, async `JobTracker`
 - `src/audio/` — FFmpeg runner, `autoLevel`, `roomtone`, `eq`, constant-power `pan` + crossfeed, `timeline` resolver, `mixdown` filtergraph compiler, `visualize` PNG engine
 - `src/script/` — Tagged script parser (`parser.ts`)
 - `src/providers/` — `TtsProvider` contract, `GeminiTtsProvider`, deterministic `MockTtsProvider`
 - `src/director/` — `DirectorReviewer` contract, `GeminiDirectorReviewer`, `MockDirectorReviewer`, built-in `personas`
 - `src/api/` — Thin Fastify REST server & routes
-- `src/mcp/` — Thin `@modelcontextprotocol/sdk` stdio server (`34` tools + `booth://runtime/idle`)
+- `src/mcp/` — Thin `@modelcontextprotocol/sdk` stdio server (`40` tools + `booth://runtime/idle`)
 - `skills/the-booth/SKILL.md` — Companion persona-neutral Agent Skill ("soft director" + Eyes + Ears QC protocol)
 - `directors/margaux_auteur.md` — Optional drop-in high-friction radio-drama Director persona
 
@@ -314,7 +321,8 @@ Core modules and agent assets live under:
 
 - **[Script Markup & Authoring Guide](./docs/script-markup.md)** — Complete syntax for `[[...]]` directives, EQ/pan presets, beds, SFX anchoring, and worked examples
 - **[REST API Reference](./docs/rest-api.md)** — All HTTP endpoints, payloads, streaming audio routes, and visual QC parameters
-- **[MCP Server & Tool Reference](./docs/mcp.md)** — Stdio setup, client snippet, inline audio limits, and all 34 MCP tools
+- **[MCP Server & Tool Reference](./docs/mcp.md)** — Stdio setup, client snippet, inline audio limits, and all 40 MCP tools
+- **[External SFX & Ambient Bed Library Spec](./docs/asset-library-spec.md)** — Mounting read-only SFX libraries (`ASSET_LIBRARY_DIRS`), zero-DB indexing/hybrid search, inline auditioning, and non-destructive slicing
 - **[The Booth Agent Skill](./skills/the-booth/SKILL.md)** — Drop-in persona-neutral "soft director" skill & calibrated Eyes + Ears QC protocol
 - **[Casting, Director's Chair & Visual QC Guide](./docs/directing-and-qc.md)** — Voice design, auditions, automated Director personas, and Eyes + Ears inspection
 - **[Margaux Laurent Director Persona](./directors/margaux_auteur.md)** — Drop-in system prompt for a fierce, taste-driven radio-drama director

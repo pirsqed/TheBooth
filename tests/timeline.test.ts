@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { resolveTimeline, TimelineError } from '../src/audio/timeline.js';
 import {
+  BedTrack,
   createDefaultProjectAudio,
   Cue,
   SfxEvent,
@@ -169,5 +170,70 @@ describe('Timeline Resolver', () => {
     expect(timeline.sfx[1]).toMatchObject({ startMs: 4500, endMs: 6500 });
     expect(timeline.contentEndMs).toBe(6500);
     expect(timeline.totalDurationMs).toBe(8500);
+  });
+
+  it('applies project.audio.leadInMs to root cues and resolves cue-anchored beds dynamically', () => {
+    const cues = [
+      makeCue('c1', 1000, { offsetMs: 0 }),
+      makeCue('c2', 1500, { offsetMs: 500 }),
+      makeCue('c3', 1000, { offsetMs: 500 }),
+    ];
+    const beds: BedTrack[] = [
+      {
+        id: 'scene_bed',
+        label: 'Scene 2 Wind',
+        kind: 'synthetic_room_tone',
+        roomToneStyle: 'warm_dark',
+        gainDb: -30,
+        loop: true,
+        startCueId: 'c2',
+        startOffsetMs: -500,
+        endCueId: 'c3',
+        endOffsetMs: 500,
+        fadeInMs: 500,
+        fadeOutMs: 500,
+        ducking: { enabled: false, amountDb: 0, attackMs: 100, releaseMs: 800 },
+      },
+    ];
+    const coldOpenSfx: SfxEvent[] = [
+      {
+        id: 'wolf_open',
+        label: 'wolf',
+        assetPath: 'wolf.wav',
+        anchor: { cueId: null, edge: 'start', offsetMs: 400 }, // stays at 400ms inside 2000ms leadIn
+        gainDb: -10,
+        pan: 0,
+        fadeInMs: 15,
+        fadeOutMs: 40,
+      },
+    ];
+
+    const audio = { ...createDefaultProjectAudio(), leadInMs: 2000, tailMs: 1000 };
+    const tl = resolveTimeline({ audio, cues, sfx: coldOpenSfx, beds }, { wolf_open: 800 });
+
+    expect(tl.leadInMs).toBe(2000);
+    expect(tl.cues.map((c) => [c.cueId, c.startMs, c.endMs])).toEqual([
+      ['c1', 2000, 3000],
+      ['c2', 3500, 5000],
+      ['c3', 5500, 6500],
+    ]);
+    expect(tl.sfx[0]).toMatchObject({ startMs: 400, endMs: 1200 });
+    // scene_bed starts 500ms before c2 (3000) and ends 500ms after c3 (7000)
+    expect(tl.beds[0]).toMatchObject({ bedId: 'scene_bed', startMs: 3000, endMs: 7000, durationMs: 4000 });
+
+    // Adding a +1000ms pause on c2 shifts scene_bed automatically!
+    cues[1]!.timing.offsetMs = 1500;
+    const tlShifted = resolveTimeline({ audio, cues, sfx: coldOpenSfx, beds }, { wolf_open: 800 });
+    expect(tlShifted.beds[0]).toMatchObject({ startMs: 4000, endMs: 8000, durationMs: 4000 });
+
+    // Unknown startCueId throws TimelineError
+    expect(() =>
+      resolveTimeline({
+        audio,
+        cues,
+        sfx: [],
+        beds: [{ ...beds[0]!, startCueId: 'nonexistent' }],
+      }),
+    ).toThrow(TimelineError);
   });
 });

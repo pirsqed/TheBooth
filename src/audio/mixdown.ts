@@ -7,6 +7,7 @@ import {
   Cue,
   ExportFormat,
   MixExport,
+  MixExportWindow,
   Project,
   SfxEvent,
   Take,
@@ -17,7 +18,12 @@ import { measureAudioLoudness, probeAudio, runCommand } from './ffmpeg.js';
 import { computeAutoLevelGain } from './leveling.js';
 import { buildPanFilterSegment } from './pan.js';
 import { buildRoomToneFilterSegment } from './roomtone.js';
-import { getActiveTake, resolveTimeline, ResolvedCueTiming } from './timeline.js';
+import {
+  computeEffectiveTakeSpan,
+  getActiveTake,
+  resolveTimeline,
+  ResolvedCueTiming,
+} from './timeline.js';
 
 export interface MixdownOptions {
   format?: ExportFormat;
@@ -26,6 +32,14 @@ export interface MixdownOptions {
   allowCustomFfmpegFilter?: boolean;
   /** Max cue stems mixed in a single ffmpeg pass before intermediate bus batching (default 32) */
   maxCuesPerBatch?: number;
+  /** Optional first cue ID for a scene-scoped partial mixdown */
+  fromCueId?: string;
+  /** Optional last cue ID for a scene-scoped partial mixdown */
+  toCueId?: string;
+  /** Optional start timestamp in seconds on the full timeline for a partial mixdown */
+  startSec?: number;
+  /** Optional end timestamp in seconds on the full timeline for a partial mixdown */
+  endSec?: number;
 }
 
 export interface MixdownTelemetry {
@@ -45,37 +59,62 @@ export interface MixdownTelemetry {
   renderedCueCount: number;
   bedCount: number;
   sfxCount: number;
+  window?: MixExportWindow;
   warnings: string[];
   createdAt: string;
 }
 
-const ASSET_FALLBACK_EXTENSIONS = ['.wav', '.ogg', '.mp3', '.flac'];
+export interface EffectiveClipSpan {
+  isSliced: boolean;
+  startMs: number;
+  durationMs: number;
+}
 
-async function resolveAssetFile(
-  store: ProjectStore,
-  assetPath: string,
-): Promise<string> {
-  const direct = store.resolveAssetPath(assetPath);
-  try {
-    const st = await fs.stat(direct);
-    if (st.isFile()) return direct;
-  } catch {
-    // Try fallback extensions if extensionless
+/**
+ * Computes a safely clamped source clip slice `(startMs, durationMs)` for an SFX event
+ * or `asset_file` bed, emitting warnings if `clipStartMs` or `clipDurationMs` exceeds
+ * the probed source duration.
+ */
+export function computeEffectiveClipSpan(
+  sourceDurationMs: number,
+  clipStartMs: number | undefined,
+  clipDurationMs: number | undefined,
+  label: string,
+  warnings: string[],
+): EffectiveClipSpan {
+  const safeSourceMs = Math.max(0, Math.round(sourceDurationMs));
+  if (clipStartMs === undefined && clipDurationMs === undefined) {
+    return { isSliced: false, startMs: 0, durationMs: safeSourceMs };
   }
 
-  if (!path.extname(assetPath)) {
-    for (const ext of ASSET_FALLBACK_EXTENSIONS) {
-      const candidate = store.resolveAssetPath(`${assetPath}${ext}`);
-      try {
-        const st = await fs.stat(candidate);
-        if (st.isFile()) return candidate;
-      } catch {
-        // continue
-      }
+  let startMs = Math.max(0, Math.round(clipStartMs ?? 0));
+  if (safeSourceMs > 0 && startMs >= safeSourceMs) {
+    const clampedStart = Math.max(0, safeSourceMs - 50);
+    warnings.push(
+      `${label}: clipStartMs (${startMs} ms) exceeds source duration (${safeSourceMs} ms); clamped to ${clampedStart} ms.`,
+    );
+    startMs = clampedStart;
+  }
+
+  const remainingMs = Math.max(10, safeSourceMs - startMs);
+  let durationMs = remainingMs;
+  if (clipDurationMs !== undefined) {
+    const requestedDur = Math.max(10, Math.round(clipDurationMs));
+    if (safeSourceMs > 0 && requestedDur > remainingMs) {
+      warnings.push(
+        `${label}: clipDurationMs (${requestedDur} ms) exceeds remaining source duration (${remainingMs} ms); clamped to ${remainingMs} ms.`,
+      );
+      durationMs = remainingMs;
+    } else {
+      durationMs = requestedDur;
     }
   }
 
-  throw new StoreError(`Audio asset not found under assets/: ${assetPath}`, 404);
+  return {
+    isSliced: true,
+    startMs,
+    durationMs,
+  };
 }
 
 function validateCustomFilter(filter: string): string {
@@ -112,6 +151,9 @@ interface RenderedCueEntry {
   take: Take;
   resolved: ResolvedCueTiming;
   wavPath: string;
+  localStartMs: number;
+  extraTrimStartMs: number;
+  maxDurationMs?: number;
 }
 
 /**
@@ -126,7 +168,7 @@ function buildCueFilterSegment(
   uid: string,
   allowCustomFfmpegFilter: boolean,
 ): string[] {
-  const { cue, take, resolved } = entry;
+  const { cue, take } = entry;
   const sampleRate = project.audio.sampleRate;
   const effectiveMode = cue.mix.autoLevel ?? project.audio.autoLevel;
   const leveling = computeAutoLevelGain({
@@ -136,15 +178,28 @@ function buildCueFilterSegment(
   });
 
   const totalGainDb = leveling.autoGainDb + cue.mix.gainDb;
-  const durSec = Math.max(0.01, take.durationMs / 1000);
+  const baseSpan = computeEffectiveTakeSpan(cue, take);
+  const trimStartMs = Math.min(baseSpan.trimEndMs, baseSpan.trimStartMs + entry.extraTrimStartMs);
+  const trimEndMs =
+    entry.maxDurationMs !== undefined
+      ? Math.min(baseSpan.trimEndMs, trimStartMs + entry.maxDurationMs)
+      : baseSpan.trimEndMs;
+  const effDurationMs = Math.max(10, trimEndMs - trimStartMs);
+  const isTrimmed = trimStartMs > 0 || trimEndMs < baseSpan.rawDurationMs;
+
+  const durSec = Math.max(0.01, effDurationMs / 1000);
   const fadeInSec = Math.min(durSec / 2, Math.max(0, cue.mix.fadeInMs / 1000));
   const fadeOutSec = Math.min(durSec / 2, Math.max(0, cue.mix.fadeOutMs / 1000));
   const fadeOutStartSec = Math.max(0, durSec - fadeOutSec);
 
-  const prePanFilters: string[] = [
-    `aresample=${sampleRate}`,
-    buildEqFilter(cue.mix.eqPreset),
-  ];
+  const prePanFilters: string[] = [`aresample=${sampleRate}`];
+  if (isTrimmed) {
+    prePanFilters.push(
+      `atrim=start=${(trimStartMs / 1000).toFixed(4)}:end=${(trimEndMs / 1000).toFixed(4)}`,
+      'asetpts=PTS-STARTPTS',
+    );
+  }
+  prePanFilters.push(buildEqFilter(cue.mix.eqPreset));
 
   if (cue.mix.customFfmpegFilter && allowCustomFfmpegFilter) {
     const safeCustom = validateCustomFilter(cue.mix.customFfmpegFilter);
@@ -165,7 +220,7 @@ function buildCueFilterSegment(
   }
 
   const prePanLabel = `${uid}_pre`;
-  const pannedLabel = resolved.startMs > 0 ? `${uid}_pan` : outputLabel;
+  const pannedLabel = entry.localStartMs > 0 ? `${uid}_pan` : outputLabel;
 
   const lines: string[] = [
     `[${inputIdx}:a]${prePanFilters.join(',')}[${prePanLabel}]`,
@@ -179,9 +234,10 @@ function buildCueFilterSegment(
     }),
   ];
 
-  if (resolved.startMs > 0) {
+  if (entry.localStartMs > 0) {
+    // Reset PTS immediately after adelay so downstream atrim=0:... never strips prepended silence
     lines.push(
-      `[${pannedLabel}]adelay=${resolved.startMs}|${resolved.startMs}[${outputLabel}]`,
+      `[${pannedLabel}]adelay=${entry.localStartMs}|${entry.localStartMs},asetpts=PTS-STARTPTS[${outputLabel}]`,
     );
   }
 
@@ -291,55 +347,278 @@ export async function runMixdown(
   const maxCuesPerBatch = options.maxCuesPerBatch ?? 32;
   const sampleRate = project.audio.sampleRate;
 
-  // 1. Resolve & probe all SFX assets upfront so timeline endMs is exact
-  const sfxAssetFiles = new Map<string, { filePath: string; durationMs: number; channels: number }>();
+  const sliceWarnings: string[] = [];
+
+  // 1. Resolve & probe all SFX assets upfront so timeline endMs (and slice fades) are exact
+  const sfxAssetFiles = new Map<
+    string,
+    {
+      filePath: string;
+      sourceDurationMs: number;
+      isSliced: boolean;
+      sliceStartMs: number;
+      effectiveDurationMs: number;
+      channels: number;
+    }
+  >();
   const sfxDurationsMs: Record<string, number> = {};
   for (const evt of project.sfx) {
-    const filePath = await resolveAssetFile(store, evt.assetPath);
-    const probe = await probeAudio(filePath, ffprobePath);
+    const resolvedAsset = await store.resolveExistingAssetFile(evt.assetPath);
+    const probe = await probeAudio(resolvedAsset.absPath, ffprobePath);
+    const clip = computeEffectiveClipSpan(
+      probe.durationMs,
+      evt.clipStartMs,
+      evt.clipDurationMs,
+      `SFX "${evt.id}"`,
+      sliceWarnings,
+    );
     sfxAssetFiles.set(evt.id, {
-      filePath,
-      durationMs: probe.durationMs,
+      filePath: resolvedAsset.absPath,
+      sourceDurationMs: probe.durationMs,
+      isSliced: clip.isSliced,
+      sliceStartMs: clip.startMs,
+      effectiveDurationMs: clip.durationMs,
       channels: probe.channels,
     });
-    sfxDurationsMs[evt.id] = probe.durationMs;
+    sfxDurationsMs[evt.id] = clip.durationMs;
   }
 
-  // 2. Resolve asset_file beds upfront
-  const bedAssetFiles = new Map<string, string>();
+  // 2. Resolve asset_file beds upfront (probing when source-sliced)
+  const bedAssetFiles = new Map<
+    string,
+    {
+      filePath: string;
+      isSliced: boolean;
+      sliceStartMs: number;
+      sliceDurationMs: number;
+    }
+  >();
   for (const bed of project.beds) {
     if (bed.kind === 'asset_file' && bed.assetPath) {
-      const filePath = await resolveAssetFile(store, bed.assetPath);
-      bedAssetFiles.set(bed.id, filePath);
+      const resolvedAsset = await store.resolveExistingAssetFile(bed.assetPath);
+      if (bed.clipStartMs !== undefined || bed.clipDurationMs !== undefined) {
+        const probe = await probeAudio(resolvedAsset.absPath, ffprobePath);
+        const clip = computeEffectiveClipSpan(
+          probe.durationMs,
+          bed.clipStartMs,
+          bed.clipDurationMs,
+          `Bed "${bed.id}"`,
+          sliceWarnings,
+        );
+        bedAssetFiles.set(bed.id, {
+          filePath: resolvedAsset.absPath,
+          isSliced: true,
+          sliceStartMs: clip.startMs,
+          sliceDurationMs: clip.durationMs,
+        });
+      } else {
+        bedAssetFiles.set(bed.id, {
+          filePath: resolvedAsset.absPath,
+          isSliced: false,
+          sliceStartMs: 0,
+          sliceDurationMs: 0,
+        });
+      }
     }
   }
 
-  // 3. Resolve timeline
+  // 3. Resolve full timeline (cues, SFX, cue-anchored beds, leadInMs, tailMs)
   const timeline = resolveTimeline(project, sfxDurationsMs);
-  const warnings: string[] = [...timeline.warnings];
+  const warnings: string[] = [...sliceWarnings, ...timeline.warnings];
+
+  const hasCueBounds = options.fromCueId !== undefined || options.toCueId !== undefined;
+  const hasSecBounds = options.startSec !== undefined || options.endSec !== undefined;
+  if (hasCueBounds && hasSecBounds) {
+    throw new StoreError(
+      'Specify either fromCueId/toCueId or startSec/endSec for partial mixdown, not both.',
+      400,
+    );
+  }
+
+  const fullTotalDurationMs = Math.max(500, timeline.totalDurationMs);
+  const isPartial = hasCueBounds || hasSecBounds;
+  let windowStartMs = 0;
+  let windowEndMs = fullTotalDurationMs;
+  let fromCueIdx = 0;
+  let toCueIdx = project.cues.length - 1;
+  let cueScopeEndMs: number | null = null;
+
+  if (hasCueBounds) {
+    if (project.cues.length === 0) {
+      throw new StoreError('Cannot use fromCueId/toCueId on a project with no cues.', 400);
+    }
+    if (options.fromCueId !== undefined) {
+      fromCueIdx = project.cues.findIndex((c) => c.id === options.fromCueId);
+      if (fromCueIdx === -1) {
+        throw new StoreError(`fromCueId not found: ${options.fromCueId}`, 404);
+      }
+    }
+    if (options.toCueId !== undefined) {
+      toCueIdx = project.cues.findIndex((c) => c.id === options.toCueId);
+      if (toCueIdx === -1) {
+        throw new StoreError(`toCueId not found: ${options.toCueId}`, 404);
+      }
+    }
+    if (fromCueIdx > toCueIdx) {
+      throw new StoreError(
+        `fromCueId "${options.fromCueId}" appears after toCueId "${options.toCueId}".`,
+        400,
+      );
+    }
+    const fromResolved = timeline.cues[fromCueIdx]!;
+    const toResolved = timeline.cues[toCueIdx]!;
+    windowStartMs = options.fromCueId !== undefined ? fromResolved.startMs : 0;
+    const tailPadMs = project.audio.tailMs ?? 2000;
+    cueScopeEndMs = toResolved.endMs;
+    windowEndMs =
+      options.toCueId !== undefined
+        ? Math.min(fullTotalDurationMs, toResolved.endMs + tailPadMs)
+        : fullTotalDurationMs;
+    if (windowEndMs <= windowStartMs) {
+      throw new StoreError('Selected cue window has zero duration (render takes first).', 400);
+    }
+  } else if (hasSecBounds) {
+    const rawStartMs = Math.round((options.startSec ?? 0) * 1000);
+    if (!Number.isFinite(rawStartMs) || rawStartMs < 0) {
+      throw new StoreError(`Invalid startSec: ${options.startSec}`, 400);
+    }
+    if (rawStartMs >= fullTotalDurationMs) {
+      throw new StoreError(
+        `startSec (${(rawStartMs / 1000).toFixed(2)}s) must be less than project duration (${(fullTotalDurationMs / 1000).toFixed(2)}s).`,
+        400,
+      );
+    }
+    const rawEndMs =
+      options.endSec !== undefined
+        ? Math.min(fullTotalDurationMs, Math.round(options.endSec * 1000))
+        : fullTotalDurationMs;
+    if (!Number.isFinite(rawEndMs) || rawEndMs <= rawStartMs + 50) {
+      throw new StoreError(
+        `endSec (${(rawEndMs / 1000).toFixed(2)}s) must be greater than startSec (${(rawStartMs / 1000).toFixed(2)}s).`,
+        400,
+      );
+    }
+    windowStartMs = rawStartMs;
+    windowEndMs = rawEndMs;
+  }
+
+  const cueIndexById = new Map<string, number>();
+  project.cues.forEach((c, idx) => cueIndexById.set(c.id, idx));
 
   const renderedCues: RenderedCueEntry[] = [];
   for (let i = 0; i < project.cues.length; i++) {
+    if (hasCueBounds && (i < fromCueIdx || i > toCueIdx)) continue;
     const cue = project.cues[i]!;
     const resolved = timeline.cues[i]!;
+    if (isPartial && (resolved.endMs <= windowStartMs || resolved.startMs >= windowEndMs)) {
+      continue;
+    }
     const take = getActiveTake(cue);
     if (!take) {
       warnings.push(`Cue "${cue.id}" has no active take and was skipped in mixdown.`);
       continue;
     }
     const wavPath = store.resolveProjectFile(project.id, take.audioPath);
-    renderedCues.push({ cue, take, resolved, wavPath });
+    const extraTrimStartMs = Math.max(0, windowStartMs - resolved.startMs);
+    const localStartMs = Math.max(0, resolved.startMs - windowStartMs);
+    const clippedEndMs = Math.min(resolved.endMs, windowEndMs);
+    const clippedStartMs = Math.max(resolved.startMs, windowStartMs);
+    const maxDurationMs =
+      resolved.endMs > windowEndMs ? Math.max(10, clippedEndMs - clippedStartMs) : undefined;
+    renderedCues.push({
+      cue,
+      take,
+      resolved,
+      wavPath,
+      localStartMs,
+      extraTrimStartMs,
+      maxDurationMs,
+    });
   }
 
-  if (renderedCues.length === 0 && project.beds.length === 0 && project.sfx.length === 0) {
+  // Filter active beds intersecting [windowStartMs, windowEndMs]
+  const activeBeds: Array<{
+    bed: BedTrack;
+    resolvedStartMs: number;
+    resolvedEndMs: number;
+    localStartMs: number;
+    localDurationMs: number;
+    fadeInMs: number;
+    fadeOutMs: number;
+  }> = [];
+  for (let i = 0; i < project.beds.length; i++) {
+    const bed = project.beds[i]!;
+    const resolvedBed = timeline.beds[i]!;
+    const clippedStart = Math.max(resolvedBed.startMs, windowStartMs);
+    const clippedEnd = Math.min(resolvedBed.endMs, windowEndMs);
+    if (clippedEnd <= clippedStart) continue;
+    activeBeds.push({
+      bed,
+      resolvedStartMs: resolvedBed.startMs,
+      resolvedEndMs: resolvedBed.endMs,
+      localStartMs: clippedStart - windowStartMs,
+      localDurationMs: Math.max(50, clippedEnd - clippedStart),
+      fadeInMs: resolvedBed.startMs >= windowStartMs ? bed.fadeInMs : Math.min(bed.fadeInMs, 30),
+      fadeOutMs: resolvedBed.endMs <= windowEndMs ? bed.fadeOutMs : Math.min(bed.fadeOutMs, 150),
+    });
+  }
+
+  // Filter active SFX intersecting [windowStartMs, windowEndMs]
+  const activeSfx: Array<{
+    evt: SfxEvent;
+    info: {
+      filePath: string;
+      sourceDurationMs: number;
+      isSliced: boolean;
+      sliceStartMs: number;
+      effectiveDurationMs: number;
+      channels: number;
+    };
+    localStartMs: number;
+    leftClipMs: number;
+    effDurationMs: number;
+  }> = [];
+  for (let i = 0; i < project.sfx.length; i++) {
+    const evt = project.sfx[i]!;
+    const resolved = timeline.sfx[i]!;
+    const info = sfxAssetFiles.get(evt.id)!;
+    if (isPartial && (resolved.endMs <= windowStartMs || resolved.startMs >= windowEndMs)) {
+      continue;
+    }
+    if (hasCueBounds && evt.anchor.cueId != null) {
+      const anchorIdx = cueIndexById.get(evt.anchor.cueId);
+      if (
+        anchorIdx !== undefined &&
+        (anchorIdx < fromCueIdx || anchorIdx > toCueIdx) &&
+        cueScopeEndMs !== null &&
+        resolved.startMs >= cueScopeEndMs
+      ) {
+        continue;
+      }
+    }
+    const leftClipMs = Math.max(0, windowStartMs - resolved.startMs);
+    const effDurationMs = Math.max(10, info.effectiveDurationMs - leftClipMs);
+    const localStartMs = Math.max(0, resolved.startMs - windowStartMs);
+    activeSfx.push({ evt, info, localStartMs, leftClipMs, effDurationMs });
+  }
+
+  if (renderedCues.length === 0 && activeBeds.length === 0 && activeSfx.length === 0) {
     throw new StoreError(
-      'Cannot mix an empty project with no rendered takes, beds, or SFX.',
+      'Cannot mix an empty project or empty window with no rendered takes, beds, or SFX.',
       400,
     );
   }
 
-  const totalDurationMs = Math.max(500, timeline.totalDurationMs);
+  const totalDurationMs = Math.max(100, windowEndMs - windowStartMs);
   const totalSec = (totalDurationMs / 1000).toFixed(4);
+  const exportWindow: MixExportWindow | undefined = isPartial
+    ? {
+        startMs: windowStartMs,
+        endMs: windowEndMs,
+        ...(options.fromCueId ? { fromCueId: options.fromCueId } : {}),
+        ...(options.toCueId ? { toCueId: options.toCueId } : {}),
+      }
+    : undefined;
 
   const exportId = `exp_${crypto.randomBytes(6).toString('hex')}`;
   const audioRelPath = `exports/${exportId}.${format}`;
@@ -412,11 +691,11 @@ export async function runMixdown(
       }
     }
 
-    // Prepare sidechain splits of [speech_bus] if any beds duck under speech
+    // Prepare sidechain splits of [speech_bus] only for active beds that duck under speech
     const duckedBedIds = new Set(
-      project.beds
-        .filter((b) => hasSpeech && b.ducking.enabled && b.ducking.amountDb < 0)
-        .map((b) => b.id),
+      activeBeds
+        .filter((b) => hasSpeech && b.bed.ducking.enabled && b.bed.ducking.amountDb < 0)
+        .map((b) => b.bed.id),
     );
 
     const masterMixInputs: string[] = [];
@@ -441,12 +720,11 @@ export async function runMixdown(
     }
 
     // 5. Build beds (synthetic room tone + looped/trimmed asset files + optional ducking)
-    for (let i = 0; i < project.beds.length; i++) {
-      const bed = project.beds[i]!;
-      const bedStartMs = Math.max(0, bed.startMs ?? 0);
-      const bedEndMs =
-        bed.endMs != null ? Math.min(totalDurationMs, bed.endMs) : totalDurationMs;
-      const bedDurationMs = Math.max(100, bedEndMs - bedStartMs);
+    for (let i = 0; i < activeBeds.length; i++) {
+      const activeBed = activeBeds[i]!;
+      const { bed } = activeBed;
+      const bedStartMs = activeBed.localStartMs;
+      const bedDurationMs = activeBed.localDurationMs;
       const bedDurationSec = (bedDurationMs / 1000).toFixed(4);
       const rawBedLabel = `bed_raw_${i}`;
       const finalBedLabel = `bed_${i}`;
@@ -458,37 +736,61 @@ export async function runMixdown(
             durationMs: bedDurationMs,
             sampleRate,
             gainDb: bed.gainDb,
-            fadeInMs: bed.fadeInMs,
-            fadeOutMs: bed.fadeOutMs,
+            fadeInMs: activeBed.fadeInMs,
+            fadeOutMs: activeBed.fadeOutMs,
             outputLabel: rawBedLabel,
             uid: `bed${i}`,
           }),
         );
       } else {
-        const assetFile = bedAssetFiles.get(bed.id)!;
+        const bedAsset = bedAssetFiles.get(bed.id)!;
         const idx = nextInputIdx++;
-        if (bed.loop) {
+        if (bedAsset.isSliced) {
+          // Fast input-side seek + duration avoids decoding long archives and keeps PTS clean
+          inputArgs.push(
+            '-ss',
+            (bedAsset.sliceStartMs / 1000).toFixed(4),
+            '-t',
+            (bedAsset.sliceDurationMs / 1000).toFixed(4),
+          );
+        } else if (bed.loop) {
           inputArgs.push('-stream_loop', '-1');
         }
-        inputArgs.push('-i', assetFile);
+        inputArgs.push('-i', bedAsset.filePath);
 
+        const effectiveBedSpanMs =
+          bedAsset.isSliced && !bed.loop
+            ? Math.min(bedDurationMs, bedAsset.sliceDurationMs)
+            : bedDurationMs;
         const fadeInSec = Math.min(
-          bedDurationMs / 2000,
-          Math.max(0, bed.fadeInMs / 1000),
+          effectiveBedSpanMs / 2000,
+          Math.max(0, activeBed.fadeInMs / 1000),
         );
         const fadeOutSec = Math.min(
-          bedDurationMs / 2000,
-          Math.max(0, bed.fadeOutMs / 1000),
+          effectiveBedSpanMs / 2000,
+          Math.max(0, activeBed.fadeOutMs / 1000),
         );
-        const fadeOutStartSec = Math.max(0, bedDurationMs / 1000 - fadeOutSec);
+        const fadeOutStartSec = Math.max(0, effectiveBedSpanMs / 1000 - fadeOutSec);
 
         const chain: string[] = [
           `aresample=${sampleRate}`,
           `aformat=sample_rates=${sampleRate}:channel_layouts=stereo`,
+          'asetpts=PTS-STARTPTS',
+        ];
+
+        if (bedAsset.isSliced && bed.loop) {
+          const clipSamples = Math.max(
+            1,
+            Math.round((bedAsset.sliceDurationMs * sampleRate) / 1000),
+          );
+          chain.push(`aloop=loop=-1:size=${clipSamples}`);
+        }
+
+        chain.push(
           `atrim=0:${bedDurationSec}`,
           'asetpts=PTS-STARTPTS',
           `volume=${bed.gainDb.toFixed(2)}dB`,
-        ];
+        );
         if (fadeInSec > 0) {
           chain.push(`afade=t=in:st=0:d=${fadeInSec.toFixed(4)}:curve=qsin`);
         }
@@ -500,11 +802,13 @@ export async function runMixdown(
         filterLines.push(`[${idx}:a]${chain.join(',')}[${rawBedLabel}]`);
       }
 
-      // Align bed start/end onto full timeline
+      // Align bed start/end onto full timeline (asetpts AFTER adelay prevents atrim from stripping delay!)
       const alignedBedLabel = duckedBedIds.has(bed.id) ? `bed_al_${i}` : finalBedLabel;
       const alignChain: string[] = [];
       if (bedStartMs > 0) {
-        alignChain.push(`adelay=${bedStartMs}|${bedStartMs}`);
+        alignChain.push(`adelay=${bedStartMs}|${bedStartMs}`, 'asetpts=PTS-STARTPTS');
+      } else {
+        alignChain.push('asetpts=PTS-STARTPTS');
       }
       alignChain.push(`apad=whole_dur=${totalSec}`, `atrim=0:${totalSec}`);
       filterLines.push(`[${rawBedLabel}]${alignChain.join(',')}[${alignedBedLabel}]`);
@@ -520,20 +824,29 @@ export async function runMixdown(
     }
 
     // 6. Build SFX events
-    for (let i = 0; i < project.sfx.length; i++) {
-      const evt: SfxEvent = project.sfx[i]!;
-      const resolved = timeline.sfx[i]!;
-      const info = sfxAssetFiles.get(evt.id)!;
+    for (let i = 0; i < activeSfx.length; i++) {
+      const { evt, info, localStartMs, leftClipMs, effDurationMs } = activeSfx[i]!;
       const idx = nextInputIdx++;
+      const effSliceStartMs = info.sliceStartMs + leftClipMs;
+      const effIsSliced = info.isSliced || leftClipMs > 0;
+      if (effIsSliced) {
+        inputArgs.push(
+          '-ss',
+          (effSliceStartMs / 1000).toFixed(4),
+          '-t',
+          (effDurationMs / 1000).toFixed(4),
+        );
+      }
       inputArgs.push('-i', info.filePath);
 
-      const durSec = Math.max(0.01, info.durationMs / 1000);
+      const durSec = Math.max(0.01, effDurationMs / 1000);
       const fadeInSec = Math.min(durSec / 2, Math.max(0, evt.fadeInMs / 1000));
       const fadeOutSec = Math.min(durSec / 2, Math.max(0, evt.fadeOutMs / 1000));
       const fadeOutStartSec = Math.max(0, durSec - fadeOutSec);
 
       const preFilters: string[] = [
         `aresample=${sampleRate}`,
+        'asetpts=PTS-STARTPTS',
         `volume=${evt.gainDb.toFixed(2)}dB`,
       ];
       if (fadeInSec > 0) {
@@ -570,8 +883,11 @@ export async function runMixdown(
       }
 
       const postFilters: string[] = [];
-      if (resolved.startMs > 0) {
-        postFilters.push(`adelay=${resolved.startMs}|${resolved.startMs}`);
+      if (localStartMs > 0) {
+        // Reset PTS immediately after adelay so atrim=0:... never strips prepended silence on FLAC/WAV slices
+        postFilters.push(`adelay=${localStartMs}|${localStartMs}`, 'asetpts=PTS-STARTPTS');
+      } else {
+        postFilters.push('asetpts=PTS-STARTPTS');
       }
       postFilters.push(`apad=whole_dur=${totalSec}`, `atrim=0:${totalSec}`);
       filterLines.push(`[${pannedLbl}]${postFilters.join(',')}[${finalLbl}]`);
@@ -676,10 +992,11 @@ export async function runMixdown(
       channels: finalProbe.channels || 2,
       masterNormalizeApplied,
       masterMakeupDb,
-      cueCount: project.cues.length,
+      cueCount: hasCueBounds ? toCueIdx - fromCueIdx + 1 : project.cues.length,
       renderedCueCount: renderedCues.length,
-      bedCount: project.beds.length,
-      sfxCount: project.sfx.length,
+      bedCount: activeBeds.length,
+      sfxCount: activeSfx.length,
+      ...(exportWindow ? { window: exportWindow } : {}),
       warnings,
       createdAt,
     };
@@ -700,6 +1017,7 @@ export async function runMixdown(
       truePeakDbtp: telemetry.truePeakDbtp,
       sampleRate: telemetry.sampleRate,
       channels: telemetry.channels,
+      ...(exportWindow ? { window: exportWindow } : {}),
       warnings,
       createdAt,
     };
