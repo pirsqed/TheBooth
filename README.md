@@ -319,6 +319,8 @@ Core modules and agent assets live under:
 
 ## Documentation
 
+- **[Case Study & Post-Mortem: *Dracula (1938)* Full-Hour Stress Test](./docs/case-study-dracula-1938.md)** — Honest field report from producing a 59.5-minute, 12-voice, 288-cue radio drama in The Booth v0.1 (workflow, telemetry, visual QC charts, and human-ear flaws)
+- **[v0.2 Roadmap](./docs/roadmap-v02.md)** — Phased engineering, DSP, and workflow upgrades driven by the *Dracula* post-mortem
 - **[Script Markup & Authoring Guide](./docs/script-markup.md)** — Complete syntax for `[[...]]` directives, EQ/pan presets, beds, SFX anchoring, and worked examples
 - **[REST API Reference](./docs/rest-api.md)** — All HTTP endpoints, payloads, streaming audio routes, and visual QC parameters
 - **[MCP Server & Tool Reference](./docs/mcp.md)** — Stdio setup, client snippet, inline audio limits, and all 40 MCP tools
