@@ -235,9 +235,9 @@ function buildCueFilterSegment(
   ];
 
   if (entry.localStartMs > 0) {
-    // Reset PTS immediately after adelay so downstream atrim=0:... never strips prepended silence
+    // Synthesize sample-accurate PTS from 0 after adelay (immune to AV_NOPTS_VALUE after pan crossfeed amix)
     lines.push(
-      `[${pannedLabel}]adelay=${entry.localStartMs}|${entry.localStartMs},asetpts=PTS-STARTPTS[${outputLabel}]`,
+      `[${pannedLabel}]adelay=${entry.localStartMs}|${entry.localStartMs},asetpts=NB_CONSUMED_SAMPLES/SR/TB[${outputLabel}]`,
     );
   }
 
@@ -802,13 +802,16 @@ export async function runMixdown(
         filterLines.push(`[${idx}:a]${chain.join(',')}[${rawBedLabel}]`);
       }
 
-      // Align bed start/end onto full timeline (asetpts AFTER adelay prevents atrim from stripping delay!)
+      // Align bed start/end onto full timeline (NB_CONSUMED_SAMPLES/SR/TB guarantees monotonic PTS from 0 after adelay)
       const alignedBedLabel = duckedBedIds.has(bed.id) ? `bed_al_${i}` : finalBedLabel;
       const alignChain: string[] = [];
       if (bedStartMs > 0) {
-        alignChain.push(`adelay=${bedStartMs}|${bedStartMs}`, 'asetpts=PTS-STARTPTS');
+        alignChain.push(
+          `adelay=${bedStartMs}|${bedStartMs}`,
+          'asetpts=NB_CONSUMED_SAMPLES/SR/TB',
+        );
       } else {
-        alignChain.push('asetpts=PTS-STARTPTS');
+        alignChain.push('asetpts=NB_CONSUMED_SAMPLES/SR/TB');
       }
       alignChain.push(`apad=whole_dur=${totalSec}`, `atrim=0:${totalSec}`);
       filterLines.push(`[${rawBedLabel}]${alignChain.join(',')}[${alignedBedLabel}]`);
@@ -884,10 +887,13 @@ export async function runMixdown(
 
       const postFilters: string[] = [];
       if (localStartMs > 0) {
-        // Reset PTS immediately after adelay so atrim=0:... never strips prepended silence on FLAC/WAV slices
-        postFilters.push(`adelay=${localStartMs}|${localStartMs}`, 'asetpts=PTS-STARTPTS');
+        // Synthesize monotonic PTS from 0 after adelay (immune to AV_NOPTS_VALUE after pan crossfeed amix and FLAC/WAV slices)
+        postFilters.push(
+          `adelay=${localStartMs}|${localStartMs}`,
+          'asetpts=NB_CONSUMED_SAMPLES/SR/TB',
+        );
       } else {
-        postFilters.push('asetpts=PTS-STARTPTS');
+        postFilters.push('asetpts=NB_CONSUMED_SAMPLES/SR/TB');
       }
       postFilters.push(`apad=whole_dur=${totalSec}`, `atrim=0:${totalSec}`);
       filterLines.push(`[${pannedLbl}]${postFilters.join(',')}[${finalLbl}]`);

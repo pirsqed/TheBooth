@@ -660,4 +660,76 @@ Rest easy now.
       service.mixProject(project.id, { fromCueId: 'c1', startSec: 1 }),
     ).rejects.toMatchObject({ statusCode: 400 });
   });
+
+  it('preserves all speech cues in a full mix when leadInMs > 0 with headphoneCrossfeed and ducked bed', async () => {
+    await store.ensureDataDirs();
+    await fs.writeFile(path.join(store.assetsDir, 'wind_bed.wav'), makeNoiseWav(1500, 0.25));
+
+    const project = await service.createProject({
+      id: 'leadin_crossfeed_repro',
+      name: 'LeadIn + Crossfeed Repro',
+      includeDefaultRoomTone: false,
+      audio: { leadInMs: 1500, tailMs: 800, headphoneCrossfeed: true },
+    });
+
+    await service.upsertBed(project.id, 'wind', {
+      label: 'Castle Wind',
+      kind: 'asset_file',
+      assetPath: 'wind_bed.wav',
+      gainDb: -32,
+      loop: true,
+      fadeInMs: 200,
+      fadeOutMs: 200,
+      ducking: { enabled: true, amountDb: -6, attackMs: 100, releaseMs: 600 },
+    });
+
+    const pans = [-0.55, 0.55, -0.35];
+    for (let i = 0; i < 3; i++) {
+      await service.addCue(project.id, {
+        id: `cue_${i + 1}`,
+        speaker: 'mara',
+        text: `Spoken dialogue cue ${i + 1} after cold open pre roll.`,
+        timing: { offsetMs: i === 0 ? 0 : 600 },
+        mix: { pan: pans[i]! },
+      });
+    }
+    await service.renderAll(project.id);
+
+    const { timeline } = await service.getProject(project.id);
+    const fullMix = await service.mixProject(project.id, { format: 'wav' });
+    const fullWav = store.resolveProjectFile(project.id, fullMix.exportRecord.audioPath);
+
+    const measureWindow = async (name: string, startSec: number, durSec: number) => {
+      const slicePath = path.join(tempDataDir, `${name}.wav`);
+      await runCommand('ffmpeg', [
+        '-hide_banner',
+        '-y',
+        '-ss',
+        startSec.toFixed(3),
+        '-t',
+        durSec.toFixed(3),
+        '-i',
+        fullWav,
+        '-c:a',
+        'pcm_s16le',
+        slicePath,
+      ]);
+      return (await measureAudioLoudness(slicePath)).measuredRmsDbfs;
+    };
+
+    // Cold-open 0.2..1.3s has only the quiet wind bed (no speech)
+    const leadInRms = await measureWindow('leadin', 0.2, 1.1);
+    expect(leadInRms).toBeLessThan(-36);
+    expect(leadInRms).toBeGreaterThan(-65);
+
+    // Every single cue must be clearly audible at its resolved timestamp!
+    for (const rc of timeline.cues) {
+      const cueRms = await measureWindow(
+        rc.cueId,
+        (rc.startMs + 150) / 1000,
+        Math.max(0.4, (rc.durationMs - 300) / 1000),
+      );
+      expect(cueRms).toBeGreaterThan(-28);
+    }
+  });
 });

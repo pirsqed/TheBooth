@@ -73,7 +73,7 @@ export function buildPanFilterSegment(options: PanFilterOptions): string[] {
   return [
     `[${inputLabel}]aformat=channel_layouts=mono,asplit=2[${dirIn}][${xfIn}]`,
     `[${dirIn}]pan=stereo|c0=${dirL}*c0|c1=${dirR}*c0[${dirOut}]`,
-    `[${xfIn}]pan=stereo|c0=${xfL}*c0|c1=${xfR}*c0,lowpass=f=4000:poles=1,adelay=${itdSamples}S|${itdSamples}S[${xfOut}]`,
-    `[${dirOut}][${xfOut}]amix=inputs=2:normalize=0:dropout_transition=0[${outputLabel}]`,
+    `[${xfIn}]pan=stereo|c0=${xfL}*c0|c1=${xfR}*c0,lowpass=f=4000:poles=1,adelay=${itdSamples}S|${itdSamples}S,asetpts=NB_CONSUMED_SAMPLES/SR/TB[${xfOut}]`,
+    `[${dirOut}][${xfOut}]amix=inputs=2:normalize=0:dropout_transition=0,asetpts=NB_CONSUMED_SAMPLES/SR/TB[${outputLabel}]`,
   ];
 }

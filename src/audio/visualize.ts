@@ -777,15 +777,20 @@ function renderMasterSvgToPng(params: {
         svg.push(
           `<rect x="${x1.toFixed(1)}" y="${sfxY}" width="${bw.toFixed(1)}" height="${laneH}" rx="3" fill="#34d399" fill-opacity="0.34" stroke="#6ee7b7" stroke-opacity="0.92" stroke-width="1.2"/>`,
         );
-        if (bw >= 36) {
-          const label =
+        const maxChars = Math.floor((bw - 10) / 6.5);
+        if (maxChars >= 3) {
+          const rawLabel =
             bw >= 185
               ? `${s.id} [${shortLbl}] pan=${panTag} (${s.startSec.toFixed(2)}-${s.endSec.toFixed(2)}s)`
               : bw >= 95
                 ? `${s.id} [${shortLbl}] ${panTag}`
                 : s.id;
+          const fitted =
+            rawLabel.length > maxChars
+              ? `${rawLabel.slice(0, Math.max(1, maxChars - 1))}…`
+              : rawLabel;
           svg.push(
-            `<text x="${(x1 + 5).toFixed(1)}" y="${(sfxY + laneH / 2 + 4).toFixed(1)}" fill="#ecfdf5" font-family="Arial, sans-serif" font-size="10.5" font-weight="700">${escapeXml(label)}</text>`,
+            `<text x="${(x1 + 5).toFixed(1)}" y="${(sfxY + laneH / 2 + 4).toFixed(1)}" fill="#ecfdf5" font-family="Arial, sans-serif" font-size="10.5" font-weight="700">${escapeXml(fitted)}</text>`,
           );
         }
       }
